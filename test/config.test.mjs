@@ -26,6 +26,45 @@ test('resolveEmailConfig wrapper still returns the default account', () => {
   assert.equal(cfg.smtp.secure, false)
 })
 
+test('webank preset resolves intranet IMAP/SMTP hosts', () => {
+  const cfg = resolveEmailConfig({ provider: 'webank', user: 'me@webank.com', password: 'p' })
+  assert.equal(cfg.imap.host, 'wemail.webank.com')
+  assert.equal(cfg.imap.port, 993)
+  assert.equal(cfg.imap.secure, true)
+  assert.equal(cfg.smtp.host, 'wemail.webank.com')
+  assert.equal(cfg.smtp.port, 465)
+  assert.equal(cfg.smtp.secure, true)
+})
+
+test('coremail preset derives IMAP/SMTP hosts from the email domain', () => {
+  const cfg = resolveEmailConfig({ provider: 'coremail', user: 'me@pku.edu.cn', password: 'p' })
+  assert.equal(cfg.imap.host, 'imap.pku.edu.cn')
+  assert.equal(cfg.imap.port, 993)
+  assert.equal(cfg.imap.secure, true)
+  assert.equal(cfg.smtp.host, 'smtp.pku.edu.cn')
+  assert.equal(cfg.smtp.port, 465)
+  assert.equal(cfg.smtp.secure, true)
+  assert.ok(PROVIDER_NAMES.includes('coremail'))
+})
+
+test('coremail preset lets explicit hosts win over the derived ones', () => {
+  const cfg = resolveEmailConfig({
+    provider: 'coremail',
+    user: 'me@x.com',
+    password: 'p',
+    imap: { host: 'mail.x.com', port: 143, secure: false },
+    smtp: { host: 'mail.x.com', port: 587, secure: false },
+  })
+  assert.equal(cfg.imap.host, 'mail.x.com')
+  assert.equal(cfg.imap.port, 143)
+  assert.equal(cfg.smtp.port, 587)
+})
+
+test('coremail preset fails loud without a domain-bearing address', () => {
+  assert.throws(() => resolveEmailSettings({ provider: 'coremail', user: 'nope', password: 'p' }), /邮箱地址/)
+  assert.throws(() => resolveEmailSettings({ provider: 'coremail', password: 'p' }), /邮箱地址/)
+})
+
 test('unknown provider fails loud with the supported list', () => {
   assert.throws(() => resolveEmailSettings({ provider: 'hotdog', user: 'x', password: 'y' }), /未知/)
   assert.ok(PROVIDER_NAMES.includes('qq'))

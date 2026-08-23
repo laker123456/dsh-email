@@ -2,7 +2,7 @@
 
 # dsh-email
 
-> **给 agent 一个邮箱**：八个国内邮箱预设开箱即用，收发/搜索/附件下载全搞定。
+> **给 agent 一个邮箱**：九个常用邮箱预设 + Coremail 通用预设开箱即用，收发/搜索/附件下载全搞定。
 
 ![npm version](https://img.shields.io/npm/v/dsh-email?label=npm&color=blue) ![npm downloads](https://img.shields.io/npm/dm/dsh-email) ![license](https://img.shields.io/npm/l/dsh-email) ![stars](https://img.shields.io/github/stars/STARDUSTLC666/dsh-email?style=social)
 
@@ -14,7 +14,7 @@
 
 DeepSeek Harness 邮件工具插件：让 agent 能**查收件箱、读邮件、搜邮件、代发邮件、收发附件**。纯插件实现，零核心改动，安装即可用。
 
-Email tools for DeepSeek Harness: list, read, search and send mail through standard IMAP/SMTP — with one-line presets for QQ / 163 / 126 / Sina / Aliyun / Gmail / Outlook / iCloud.
+Email tools for DeepSeek Harness: list, read, search and send mail through standard IMAP/SMTP — with one-line presets for QQ / 163 / 126 / Sina / Aliyun / Gmail / Outlook / iCloud / WeBank, plus a generic Coremail preset.
 
 纯 Node 实现，**全平台通用**（Windows / macOS / Linux 同一份代码），不依赖 shell、无原生二进制。
 
@@ -65,7 +65,7 @@ dsh plugin --profile web add dsh-email
 ```yaml
 - id: tool-email
   config:
-    provider: qq          # qq | 163 | 126 | sina | aliyun | gmail | outlook | icloud
+    provider: qq          # qq | 163 | 126 | sina | aliyun | gmail | outlook | icloud | webank | coremail
     user: you@qq.com
     password: 你的授权码   # 强烈建议改用环境变量 DSH_EMAIL_PASSWORD，见下
 ```
@@ -108,6 +108,8 @@ dsh plugin --profile web add dsh-email
 | `gmail` | imap.gmail.com:993 | smtp.gmail.com:465 |
 | `outlook` | outlook.office365.com:993 | smtp.office365.com:587 (STARTTLS) |
 | `icloud` | imap.mail.me.com:993 | smtp.mail.me.com:587 (STARTTLS) |
+| `webank` | wemail.webank.com:993 | wemail.webank.com:465（微众内网 Coremail，仅内网/VPN 可达） |
+| `coremail` | imap.<邮箱域名>:993 | smtp.<邮箱域名>:465（按邮箱后缀自动推导，覆盖高校/企业 Coremail 部署；部署域名不符时可手填 imap/smtp 覆盖） |
 
 ### 完整配置项
 

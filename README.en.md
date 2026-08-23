@@ -4,7 +4,7 @@
 
 ![dsh-email banner](https://raw.githubusercontent.com/STARDUSTLC666/dsh-email/main/assets/banner.png)
 
-Email tools for DeepSeek Harness: let the agent **check the inbox, read mail, search mail, send mail on your behalf, and send/receive attachments** through standard IMAP/SMTP — with one-line presets for QQ / 163 / 126 / Sina / Aliyun / Gmail / Outlook / iCloud. Pure plugin implementation, zero core changes, works out of the box.
+Email tools for DeepSeek Harness: let the agent **check the inbox, read mail, search mail, send mail on your behalf, and send/receive attachments** through standard IMAP/SMTP — with one-line presets for QQ / 163 / 126 / Sina / Aliyun / Gmail / Outlook / iCloud / WeBank, plus a generic Coremail preset that derives the servers from your email address. Pure plugin implementation, zero core changes, works out of the box.
 
 Pure Node, **cross-platform** (one codebase for Windows / macOS / Linux), no shell, no native binaries.
 
@@ -55,7 +55,7 @@ In your profile's `cordis.patch.yml` (under `$DSH_HOME/profiles/<name>/`), overr
 ```yaml
 - id: tool-email
   config:
-    provider: qq          # qq | 163 | 126 | sina | aliyun | gmail | outlook | icloud
+    provider: qq          # qq | 163 | 126 | sina | aliyun | gmail | outlook | icloud | webank | coremail
     user: you@qq.com
     password: 你的授权码   # 强烈建议改用环境变量 DSH_EMAIL_PASSWORD，见下
 ```
@@ -98,6 +98,8 @@ Top-level `provider`/`user`/`password`/`imap`/`smtp`/`inboxFolder` remain availa
 | `gmail` | imap.gmail.com:993 | smtp.gmail.com:465 |
 | `outlook` | outlook.office365.com:993 | smtp.office365.com:587 (STARTTLS) |
 | `icloud` | imap.mail.me.com:993 | smtp.mail.me.com:587 (STARTTLS) |
+| `webank` | wemail.webank.com:993 | wemail.webank.com:465 (intranet-only hosts) |
+| `coremail` | imap.<your-domain>:993 | smtp.<your-domain>:465 (hosts derived from your email address; covers university/enterprise Coremail deployments - override with explicit imap/smtp when the pattern differs) |
 
 ## Getting an authorization code
 

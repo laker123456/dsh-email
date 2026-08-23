@@ -2,7 +2,7 @@ import { homedir } from 'node:os'
 import { parse as parseYaml } from 'yaml'
 import { join } from 'node:path'
 
-export type ProviderName = 'qq' | '163' | '126' | 'sina' | 'aliyun' | 'gmail' | 'outlook' | 'icloud'
+export type ProviderName = 'qq' | '163' | '126' | 'sina' | 'aliyun' | 'gmail' | 'outlook' | 'icloud' | 'webank' | 'coremail'
 
 export interface ImapConfig {
   host?: string
@@ -65,9 +65,29 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
   gmail: { imap: { host: 'imap.gmail.com', port: 993, secure: true }, smtp: { host: 'smtp.gmail.com', port: 465, secure: true } },
   outlook: { imap: { host: 'outlook.office365.com', port: 993, secure: true }, smtp: { host: 'smtp.office365.com', port: 587, secure: false } },
   icloud: { imap: { host: 'imap.mail.me.com', port: 993, secure: true }, smtp: { host: 'smtp.mail.me.com', port: 587, secure: false } },
+  // WeBank (Coremail deployment, intranet-only hosts)
+  webank: { imap: { host: 'wemail.webank.com', port: 993, secure: true }, smtp: { host: 'wemail.webank.com', port: 465, secure: true } },
 }
 
-export const PROVIDER_NAMES = Object.keys(PROVIDER_PRESETS)
+export const PROVIDER_NAMES = [...Object.keys(PROVIDER_PRESETS), 'coremail']
+
+const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/
+
+/**
+ * Coremail deployments (many universities and enterprises) conventionally
+ * expose imap.<domain> / smtp.<domain>: derive the hosts from the email
+ * address itself. Explicit imap/smtp config still wins over these defaults.
+ */
+function coremailPresetFor(name: string, user: string): ProviderPreset {
+  const domain = user.split('@')[1]?.toLowerCase() ?? ''
+  if (!DOMAIN_RE.test(domain)) {
+    throw new Error(`dsh-email：账号 "${name}" 使用 provider "coremail" 时 user 必须是完整邮箱地址（用于推导服务器主机名），当前为 "${user}"`)
+  }
+  return {
+    imap: { host: 'imap.' + domain, port: 993, secure: true },
+    smtp: { host: 'smtp.' + domain, port: 465, secure: true },
+  }
+}
 
 export const EMAIL_PASSWORD_ENV = 'DSH_EMAIL_PASSWORD'
 
@@ -187,11 +207,17 @@ export function resolveEmailSettings(config: EmailConfig | undefined): ResolvedE
 
 /** Merge one account over the shared shorthand and validate it. */
 function resolveAccount(name: string, common: AccountConfig, acc: AccountConfig, allowEnvPassword: boolean): ResolvedEmailConfig {
-  const preset = acc.provider === undefined ? PROVIDER_PRESETS[common.provider ?? ''] : PROVIDER_PRESETS[acc.provider]
-  if ((acc.provider ?? common.provider) !== undefined && preset === undefined) {
-    throw new Error(`dsh-email：账号 "${name}" 的 provider "${acc.provider ?? common.provider}" 未知，可选：${PROVIDER_NAMES.join('/')}；或省略 provider 直接填 imap.host 与 smtp.host`)
-  }
   const user = (acc.user ?? common.user ?? '').trim()
+  const provider = acc.provider ?? common.provider
+  let preset: ProviderPreset | undefined
+  if (provider === 'coremail') {
+    preset = coremailPresetFor(name, user)
+  } else {
+    preset = PROVIDER_PRESETS[provider ?? '']
+    if (provider !== undefined && preset === undefined) {
+      throw new Error(`dsh-email：账号 "${name}" 的 provider "${provider}" 未知，可选：${PROVIDER_NAMES.join('/')}；或省略 provider 直接填 imap.host 与 smtp.host`)
+    }
+  }
   const password = acc.password ?? common.password ?? (allowEnvPassword ? process.env[EMAIL_PASSWORD_ENV] ?? '' : '')
   const imap = {
     host: acc.imap?.host ?? common.imap?.host ?? preset?.imap.host,
