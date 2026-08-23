@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { stripHtml, truncateText, flattenAddresses, sanitizeFilename, parseRawMessage } from '../lib/index.js'
+import { stripHtml, truncateText, flattenAddresses, sanitizeFilename, parseRawMessage, parseHtmlMessage } from '../lib/index.js'
 
 test('stripHtml drops tags, keeps text, turns block tags into newlines', () => {
   const html = '<html><head><style>x{}</style></head><body><p>第一段</p><p>第二<br>行</p><script>bad()</script>尾</body></html>'
@@ -85,6 +85,62 @@ test('parseRawMessage truncates oversized bodies', async () => {
   const body = await parseRawMessage(source, 500)
   assert.equal(body.truncated, true)
   assert.ok(body.text.length < 600)
+})
+
+test('parseHtmlMessage rewrites cid images to data URIs and flags remote images', async () => {
+  const source = Buffer.from([
+    'From: Alice <alice@example.com>',
+    'Subject: HTML mail',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/related; boundary="b"',
+    '',
+    '--b',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    '<p>你好</p><img src="cid:img1"><img src="https://tracker.example/pixel.gif">',
+    '--b',
+    'Content-Type: image/png',
+    'Content-ID: <img1>',
+    'Content-Disposition: inline',
+    'Content-Transfer-Encoding: base64',
+    '',
+    'iVBORw0KGgo=',
+    '--b--',
+  ].join('\r\n'))
+  const view = await parseHtmlMessage(source, 512 * 1024)
+  assert.equal(view.subject, 'HTML mail')
+  assert.equal(view.from[0].address, 'alice@example.com')
+  assert.ok(view.html.includes('data:image/png;base64,'))
+  assert.ok(!view.html.includes('cid:img1'))
+  assert.equal(view.hasRemoteImages, true)
+  assert.equal(view.attachments.length, 1)
+})
+
+test('parseHtmlMessage keeps inline images without a contentId untouched', async () => {
+  const source = Buffer.from([
+    'From: a@b.c',
+    'Subject: s',
+    'Content-Type: text/html',
+    '',
+    '<p><img src="cid:missing"></p>',
+  ].join('\r\n'))
+  const view = await parseHtmlMessage(source, 512 * 1024)
+  assert.ok(view.html.includes('cid:missing'))
+})
+
+test('parseHtmlMessage returns empty html for plain-text mail', async () => {
+  const source = Buffer.from('From: a@b.c\r\nSubject: t\r\nContent-Type: text/plain\r\n\r\n纯文本内容')
+  const view = await parseHtmlMessage(source, 1024)
+  assert.equal(view.html, '')
+  assert.equal(view.text, '纯文本内容')
+  assert.equal(view.hasRemoteImages, false)
+})
+
+test('parseHtmlMessage drops oversized html', async () => {
+  const html = '<p>' + 'x'.repeat(2 * 1024 * 1024 + 100) + '</p>'
+  const source = Buffer.from('From: a@b.c\r\nSubject: big\r\nContent-Type: text/html\r\n\r\n' + html)
+  const view = await parseHtmlMessage(source, 1024)
+  assert.equal(view.html, '')
 })
 
 test('selectAttachmentPart maps the mailparser list onto bodyStructure parts', async () => {

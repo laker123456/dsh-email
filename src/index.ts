@@ -2,6 +2,7 @@ import { clampInt, resolveEmailSettings, type EmailConfig, type ResolvedEmailSet
 import { EmailPool, messageOf } from './mail-client.js'
 import { EmailSettingsSchema, SETTINGS_NAMESPACE, toEmailConfig, toSettingsBase, validateSettingsValue, type EmailSettingsValue } from './settings.js'
 import { EmailSettingsBackend, installEmailSettingsWeb } from './web.js'
+import { installInboxWeb } from './inbox-web.js'
 import type {
   EmailAttachmentArgs,
   EmailAttachmentResult,
@@ -257,6 +258,7 @@ export function apply(ctx: any, config: Config = {}): void {
   })
 
   installEmailSettingsWeb(ctx, new EmailSettingsBackend(ctx, settingsScope, config))
+  installInboxWeb(ctx, getPool)
 
   ctx.tools.register({
     name: 'email_list',
@@ -449,4 +451,6 @@ export { resolveEmailConfig, resolveEmailSettings, parseAccountsYaml, clampInt, 
 export { stripHtml, truncateText, flattenAddresses, sanitizeFilename, parseRawMessage } from './parse.js'
 export { EmailPool, MailError, messageOf, validateAttachmentPaths, selectAttachmentPart, messageMatchesQuery } from './mail-client.js'
 export { SETTINGS_NAMESPACE, EmailSettingsSchema, toSettingsBase, toEmailConfig, validateSettingsValue } from './settings.js'
-export { SETTINGS_ROUTE, EmailSettingsBackend, installEmailSettingsWeb } from './web.js'
+export { SETTINGS_ROUTE, EmailSettingsBackend, installEmailSettingsWeb, isLoopbackRequest } from './web.js'
+export { INBOX_ROUTE, installInboxWeb } from './inbox-web.js'
+export { parseHtmlMessage } from './parse.js'

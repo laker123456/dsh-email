@@ -13,6 +13,8 @@ declare module 'mailparser' {
     filename?: string
     contentType: string
     size: number
+    contentId?: string
+    content: Buffer
   }
 
   export interface ParsedMail {

@@ -82,3 +82,60 @@ export async function parseRawMessage(source: Buffer, maxBodyChars: number): Pro
     truncated: limited.truncated,
   }
 }
+
+/** The HTML view of one message, served to the sandboxed reader iframe. */
+export interface HtmlMessageView {
+  subject: string
+  from: AddressEntry[]
+  date: string
+  /** Original HTML with cid: images rewritten to data: URIs; '' when absent or oversized. */
+  html: string
+  /** Plain-text fallback when html is ''. */
+  text: string
+  /** The html references at least one http(s) image (blocked by default). */
+  hasRemoteImages: boolean
+  attachments: EmailAttachmentMeta[]
+}
+
+const MAX_HTML_CHARS = 2 * 1024 * 1024
+const CID_SRC_RE = /\ssrc\s*=\s*(["'])cid:([^"'>]+)\1/gi
+const REMOTE_IMG_RE = /<img[^>]*?\ssrc\s*=\s*(["'])https?:/i
+
+/**
+ * Parse a message for browser rendering. No HTML sanitization here: the
+ * response that carries this HTML enforces a CSP sandbox (scripts, forms and
+ * network access all disabled), which is the actual security boundary.
+ */
+export async function parseHtmlMessage(source: Buffer, maxInlineImageBytes: number): Promise<HtmlMessageView> {
+  const parsed = await simpleParser(source)
+  let html = typeof parsed.html === 'string' ? parsed.html : ''
+  if (html.length > MAX_HTML_CHARS) html = ''
+  const inlineByCid = new Map<string, { contentType: string; content: Buffer }>()
+  for (const att of parsed.attachments ?? []) {
+    const cid = typeof att.contentId === 'string' ? att.contentId.replace(/^<|>$/g, '') : ''
+    if (cid !== '' && att.content.length <= maxInlineImageBytes) {
+      inlineByCid.set(cid, { contentType: att.contentType, content: att.content })
+    }
+  }
+  if (html !== '' && inlineByCid.size > 0) {
+    html = html.replace(CID_SRC_RE, (full: string, quote: string, cid: string) => {
+      const att = inlineByCid.get(cid)
+      if (att === undefined) return full
+      return ' src=' + quote + 'data:' + att.contentType + ';base64,' + att.content.toString('base64') + quote
+    })
+  }
+  return {
+    subject: parsed.subject ?? '',
+    from: flattenAddresses(parsed.from),
+    date: parsed.date instanceof Date ? parsed.date.toISOString() : '',
+    html,
+    text: parsed.text ?? '',
+    hasRemoteImages: html !== '' && REMOTE_IMG_RE.test(html),
+    attachments: (parsed.attachments ?? []).map((att, index) => ({
+      filename: att.filename ?? '(unnamed)',
+      contentType: att.contentType,
+      size: att.size,
+      part: 'attachment-' + index,
+    })),
+  }
+}

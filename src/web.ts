@@ -6,6 +6,16 @@ import { EmailPool, messageOf } from './mail-client.js'
 export const SETTINGS_ROUTE = '/_dsh/dsh-email/settings'
 
 /**
+ * Localhost-only: these routes carry the stored authorization code (settings)
+ * or full message content (inbox), so they must never leak to the LAN even
+ * when the webserver is bound to 0.0.0.0.
+ */
+export function isLoopbackRequest(req: any): boolean {
+  const remote = String(req.socket?.remoteAddress ?? '')
+  return remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
+}
+
+/**
  * Browser-facing backend: snapshot the settings namespace, save it with
  * optimistic concurrency, and test a draft account over a live IMAP login.
  */
@@ -75,11 +85,7 @@ export class EmailSettingsBackend {
   }
 
   async handle(req: any, res: any) {
-    // Localhost-only: the snapshot carries the stored authorization code. If a
-    // deployment binds the webserver to 0.0.0.0, this route must never leak it
-    // to the LAN.
-    const remote = String(req.socket?.remoteAddress ?? '')
-    if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+    if (!isLoopbackRequest(req)) {
       this.responseJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'dsh-email settings route is localhost-only' } })
       return
     }

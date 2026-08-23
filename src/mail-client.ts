@@ -143,6 +143,10 @@ export class EmailPool {
     return name?.trim() || this.settings.defaultAccount
   }
 
+  accountNames(): string[] {
+    return [...this.settings.accounts.keys()]
+  }
+
   /** Serialize operations per account: one IMAP connection serves one op at a time. */
   private enqueue<T>(name: string, task: () => Promise<T>): Promise<T> {
     const prev = this.queues.get(name) ?? Promise.resolve()
@@ -374,6 +378,20 @@ export class EmailPool {
       }
       const body = await parseRawMessage(message.source, this.settings.maxBodyChars)
       return { account: name, uid, folder: folderName, ...body }
+    })
+  }
+
+  /** Raw RFC822 source of one message, for callers that need the original HTML. */
+  async readSource(accountName: string | undefined, uid: number, folder: string): Promise<Buffer> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    return this.withImap(name, folderName, async (client) => {
+      const message = await client.fetchOne(uid, { uid: true, source: true }, { uid: true })
+      if (message === false || message.source === undefined) {
+        throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
+      }
+      return message.source
     })
   }
 
