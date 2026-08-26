@@ -4,6 +4,14 @@ import { PROVIDER_NAMES, type EmailConfig } from './config.js'
 /** Settings-document namespace this plugin owns (editable from the Web settings page). */
 export const SETTINGS_NAMESPACE = 'dsh-email'
 
+/** One smart-classification label rule (subject-keyword match). */
+export const EmailLabelSchema = z.object({
+  id: z.string().default(''),
+  name: z.string().default(''),
+  keywords: z.array(z.string()).default([]),
+  color: z.string().default(''),
+})
+
 /**
  * The settings-page shape: the single default account plus shared policy.
  * Multi-account (`accounts` map) stays YAML-only; the page edits the
@@ -28,7 +36,15 @@ export const EmailSettingsSchema = z.object({
     port: z.number().default(465),
     secure: z.boolean().default(true),
   }),
+  labels: z.array(EmailLabelSchema).default([]),
 })
+
+export interface EmailLabel {
+  id: string
+  name: string
+  keywords: string[]
+  color: string
+}
 
 export interface EmailSettingsValue {
   provider: string
@@ -41,6 +57,7 @@ export interface EmailSettingsValue {
   accountsYaml: string
   imap: { host: string; port: number; secure: boolean }
   smtp: { host: string; port: number; secure: boolean }
+  labels: EmailLabel[]
 }
 
 /** Project the row config (cordis.patch.yml) into the settings-schema base shape. */

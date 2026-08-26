@@ -1,10 +1,17 @@
-import { readFile } from 'node:fs/promises'
-import { clampInt } from './config.js'
+import { mkdir, writeFile, readFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { tmpdir } from 'node:os'
+import { clampInt, PROVIDER_NAMES, PROVIDER_PRESETS } from './config.js'
 import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
+import { SETTINGS_NAMESPACE, validateSettingsValue, type EmailSettingsValue } from './settings.js'
 import { isLoopbackRequest } from './web.js'
 
 export const INBOX_ROUTE = '/_dsh/dsh-email/inbox'
+
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
+const ASSET_DIR = join(MODULE_DIR, '..', 'assets')
 
 const MAX_INLINE_IMAGE_BYTES = 512 * 1024
 const TEXT_FALLBACK_CHARS = 200000
@@ -60,25 +67,345 @@ function messageHtmlDocument(html: string, text: string): string {
     + '</pre></body></html>'
 }
 
-async function handleInbox(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+async function readJsonBody(req: any, maxBytes = 64 * 1024): Promise<any> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) {
+    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    if (chunks.reduce((n, c) => n + c.length, 0) + part.length > maxBytes) throw new RangeError('request body too large')
+    chunks.push(part)
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+}
+
+/** POST /api/mark-seen: flip \\Seen on a message so the inbox list updates. */
+async function handleMarkSeen(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+  let body: any
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const uid = Number(body?.uid)
+  const account = typeof body?.account === 'string' && body.account !== '' ? body.account : undefined
+  const folder = typeof body?.folder === 'string' && body.folder !== '' ? body.folder : ''
+  if (!Number.isInteger(uid) || uid <= 0) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'uid 必须是正整数' } })
+    return
+  }
+  if (folder === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'folder 不能为空' } })
+    return
+  }
+  try {
+    await getPool().markSeen(account, uid, folder)
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const message = messageOf(error, '标记已读失败')
+    const bad = error instanceof MailError || message.startsWith('dsh-email')
+    responseJson(res, bad ? 400 : 500, { ok: false, error: { code: bad ? 'bad-request' : 'internal', message } })
+  }
+}
+
+/** POST /api/send: send a message straight from the inbox page (no agent approval). */
+async function handleSend(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req, 256 * 1024) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const account = typeof body?.account === 'string' && body.account !== '' ? body.account : undefined
+  const to = typeof body?.to === 'string' ? body.to.trim() : ''
+  const subject = typeof body?.subject === 'string' ? body.subject.trim() : ''
+  const text = typeof body?.text === 'string' ? body.text : ''
+  const html = typeof body?.html === 'string' ? body.html : ''
+  const cc = typeof body?.cc === 'string' ? body.cc.trim() : ''
+  const bcc = typeof body?.bcc === 'string' ? body.bcc.trim() : ''
+  const attachments = Array.isArray(body?.attachments) ? body.attachments.filter((p: any) => typeof p === 'string' && p !== '') : []
+  if (to === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '收件人不能为空' } })
+    return
+  }
+  if (subject === '' && text === '' && html === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '主题和正文不能同时为空' } })
+    return
+  }
+  try {
+    const value = await getPool().send(account, to, subject, text || undefined, html || undefined, cc || undefined, bcc || undefined, attachments.length > 0 ? attachments : undefined)
+    responseJson(res, 200, { ok: true, value })
+  } catch (error) {
+    const message = messageOf(error, '发信失败')
+    const bad = error instanceof MailError || message.startsWith('dsh-email')
+    responseJson(res, bad ? 400 : 500, { ok: false, error: { code: bad ? 'bad-request' : 'internal', message } })
+  }
+}
+
+/** POST /api/upload: accept a multipart file upload, write to a deterministic temp path, return the absolute path. */
+async function handleUpload(req: any, res: any): Promise<void> {
+  const contentType = String(req.headers['content-type'] ?? '')
+  const boundaryMatch = contentType.match(/boundary=(.+)$/i)
+  if (!boundaryMatch) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'expected multipart/form-data' } })
+    return
+  }
+  const boundary = '--' + boundaryMatch[1]
+  const chunks: Buffer[] = []
+  for await (const chunk of req) {
+    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    if (chunks.reduce((n, c) => n + c.length, 0) + part.length > 25 * 1024 * 1024) {
+      responseJson(res, 413, { ok: false, error: { code: 'too-large', message: '附件超过 25MB 上限' } })
+      return
+    }
+    chunks.push(part)
+  }
+  const buf = Buffer.concat(chunks)
+  // Split on boundary, parse each part's headers + body.
+  const parts: Array<{ filename: string; data: Buffer }> = []
+  const sep = Buffer.from('\r\n')
+  let cursor = 0
+  while (cursor < buf.length) {
+    const startIdx = buf.indexOf(boundary, cursor)
+    if (startIdx < 0) break
+    const nextIdx = buf.indexOf(boundary, startIdx + boundary.length)
+    if (nextIdx < 0) break
+    const partBuf = buf.subarray(startIdx + boundary.length + 2, nextIdx - 2) // -2 strips trailing \r\n before boundary
+    cursor = nextIdx
+    const headerEnd = partBuf.indexOf('\r\n\r\n')
+    if (headerEnd < 0) continue
+    const headerStr = partBuf.subarray(0, headerEnd).toString('utf8')
+    const data = partBuf.subarray(headerEnd + 4)
+    const dispMatch = headerStr.match(/Content-Disposition:[^\r\n]+/i)
+    if (!dispMatch) continue
+    const fnameMatch = dispMatch[0].match(/filename="([^"]*)"/i)
+    if (!fnameMatch || fnameMatch[1] === '') continue
+    parts.push({ filename: fnameMatch[1], data })
+  }
+  if (parts.length === 0) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '未找到附件文件' } })
+    return
+  }
+  const outPaths: string[] = []
+  for (const p of parts) {
+    const safeName = p.filename.replace(/[^\w.\u4e00-\u9fa5-]/g, '_')
+    const dir = join(tmpdir(), 'dsh-email-uploads')
+    await mkdir(dir, { recursive: true })
+    const stamp = Date.now() + '-' + Math.random().toString(36).slice(2, 8)
+    const full = join(dir, stamp + '-' + safeName)
+    await writeFile(full, p.data)
+    outPaths.push(full)
+  }
+  responseJson(res, 200, { ok: true, value: { paths: outPaths } })
+}
+
+/** POST /api/login: write {provider, user, password} into the settings scope. */
+async function handleLogin(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const provider = typeof body?.provider === 'string' ? body.provider.trim() : ''
+  const user = typeof body?.user === 'string' ? body.user.trim() : ''
+  const password = typeof body?.password === 'string' ? body.password : ''
+  if (!user) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '邮箱地址不能为空' } })
+    return
+  }
+  if (!password) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '授权码不能为空' } })
+    return
+  }
+  if (provider !== '' && !PROVIDER_NAMES.includes(provider as any)) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '未知的 provider，可选：' + PROVIDER_NAMES.join('/') } })
+    return
+  }
+  try {
+    if (ctx.settings.writable === false) throw new Error('settings provider is read-only')
+    const current = settingsScope.get() as EmailSettingsValue
+    const preset = PROVIDER_PRESETS[provider]
+    // Non-coremail providers: write the preset's imap/smtp host/port/secure
+    // alongside the credentials, because the settings schema defaults host to
+    // '' and toEmailConfig treats an empty string as "user explicitly cleared
+    // the host" — which would shadow the provider preset and break login.
+    const next: EmailSettingsValue = preset
+      ? { ...current, provider, user, password, imap: { ...preset.imap }, smtp: { ...preset.smtp } }
+      : { ...current, provider, user, password }
+    validateSettingsValue(next)
+    const descriptor = (ctx.settings.describe?.() ?? []).find((row: any) => row.ns === SETTINGS_NAMESPACE)
+    const expectedRevision = descriptor?.revision ?? 0
+    await ctx.settings.replace(SETTINGS_NAMESPACE, next, expectedRevision)
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, {
+      ok: false,
+      error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '保存失败') },
+    })
+  }
+}
+
+/** Read-modify-write the settings scope with optimistic concurrency. */
+async function mutateSettings(settingsScope: any, ctx: any, mutate: (current: EmailSettingsValue) => EmailSettingsValue): Promise<void> {
+  if (ctx.settings.writable === false) throw new Error('settings provider is read-only')
+  const current = settingsScope.get() as EmailSettingsValue
+  const next = mutate(current)
+  validateSettingsValue(next)
+  const descriptor = (ctx.settings.describe?.() ?? []).find((row: any) => row.ns === SETTINGS_NAMESPACE)
+  const expectedRevision = descriptor?.revision ?? 0
+  await ctx.settings.replace(SETTINGS_NAMESPACE, next, expectedRevision)
+}
+
+/** GET /api/labels → return the stored labels array. */
+function handleListLabels(settingsScope: any, res: any): void {
+  const value = settingsScope.get() as EmailSettingsValue
+  responseJson(res, 200, { ok: true, value: value.labels ?? [] })
+}
+
+/** POST /api/labels → create or update a label by id. */
+async function handleSaveLabel(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const id = typeof body?.id === 'string' ? body.id.trim() : ''
+  const name = typeof body?.name === 'string' ? body.name.trim() : ''
+  const color = typeof body?.color === 'string' ? body.color.trim() : ''
+  const keywords = Array.isArray(body?.keywords) ? body.keywords.map((k: any) => String(k).trim()).filter((k: string) => k !== '') : []
+  if (id === '' || name === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'id 和 name 不能为空' } })
+    return
+  }
+  try {
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const labels = (current.labels ?? []).slice()
+      const idx = labels.findIndex(l => l.id === id)
+      const label = { id, name, keywords, color }
+      if (idx >= 0) labels[idx] = label
+      else labels.push(label)
+      return { ...current, labels }
+    })
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '保存失败') } })
+  }
+}
+
+/** POST /api/labels/delete → remove a label by id. */
+async function handleDeleteLabel(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const id = typeof body?.id === 'string' ? body.id.trim() : ''
+  if (id === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'id 不能为空' } })
+    return
+  }
+  try {
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const labels = (current.labels ?? []).filter(l => l.id !== id)
+      return { ...current, labels }
+    })
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '删除失败') } })
+  }
+}
+
+async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
   // Localhost-only, same policy as the settings route: full message content
   // must never leak to the LAN when the webserver binds 0.0.0.0.
   if (!isLoopbackRequest(req)) {
     responseJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'dsh-email inbox route is localhost-only' } })
     return
   }
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const sub = url.pathname.slice(INBOX_ROUTE.length)
+
+  if (req.method === 'POST' && sub === '/api/login') {
+    await handleLogin(settingsScope, ctx, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/mark-seen') {
+    await handleMarkSeen(getPool, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/send') {
+    await handleSend(getPool, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/upload') {
+    await handleUpload(req, res)
+    return
+  }
+  if (req.method === 'GET' && sub === '/api/labels') {
+    handleListLabels(settingsScope, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/labels') {
+    await handleSaveLabel(settingsScope, ctx, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/labels/delete') {
+    await handleDeleteLabel(settingsScope, ctx, req, res)
+    return
+  }
+
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET')
     responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
     return
   }
-  const url = new URL(req.url ?? '/', 'http://localhost')
-  const sub = url.pathname.slice(INBOX_ROUTE.length)
   const account = url.searchParams.get('account') ?? undefined
   const folder = url.searchParams.get('folder') ?? ''
   try {
     if (sub === '' || sub === '/') {
       responseHtml(res, 200, inboxPageHtml())
+      return
+    }
+    if (sub === '/api/asset/emailAI.png') {
+      try {
+        const data = await readFile(join(ASSET_DIR, 'emailAI.png'))
+        res.setHeader('Content-Type', 'image/png')
+        res.setHeader('Content-Length', String(data.length))
+        res.setHeader('Cache-Control', 'no-store')
+        res.writeHead(200)
+        res.end(data)
+      } catch {
+        responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'asset missing' } })
+      }
+      return
+    }
+    if (sub === '/api/asset/assistant.html') {
+      try {
+        const data = await readFile(join(ASSET_DIR, '智能助手页面.html'))
+        const bytes = Buffer.from(data)
+        res.setHeader('Content-Type', 'text/html; charset=utf-8')
+        res.setHeader('Content-Length', String(bytes.length))
+        res.setHeader('Cache-Control', 'no-store')
+        res.setHeader('X-Content-Type-Options', 'nosniff')
+        res.writeHead(200)
+        res.end(bytes)
+      } catch {
+        responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'asset missing' } })
+      }
+      return
+    }
+    if (sub === '/api/me') {
+      const pool = getPool()
+      const name = pool.resolveName(account)
+      try {
+        const cfg = pool.account(name)
+        responseJson(res, 200, { ok: true, value: { account: name, user: cfg.user ?? '' } })
+      } catch (error) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: messageOf(error, '未配置') } })
+      }
       return
     }
     if (sub === '/api/folders') {
@@ -90,6 +417,18 @@ async function handleInbox(getPool: () => EmailPool, req: any, res: any): Promis
     if (sub === '/api/messages') {
       const pool = getPool()
       const limit = clampInt(Number(url.searchParams.get('limit') ?? 20), 20, 1, 100)
+      const labelId = url.searchParams.get('label')
+      if (labelId) {
+        const sv = settingsScope.get() as EmailSettingsValue
+        const label = (sv.labels ?? []).find(l => l.id === labelId)
+        if (!label) {
+          responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '标签不存在：' + labelId } })
+          return
+        }
+        const value = await pool.listByLabel(account, label.keywords, limit)
+        responseJson(res, 200, { ok: true, value })
+        return
+      }
       const offset = clampInt(Number(url.searchParams.get('offset') ?? 0), 0, 0, 100000)
       const value = await pool.list(account, folder, limit, offset, url.searchParams.get('unreadOnly') === '1')
       responseJson(res, 200, { ok: true, value })
@@ -140,13 +479,13 @@ async function handleInbox(getPool: () => EmailPool, req: any, res: any): Promis
 }
 
 /** Mount the read-only inbox page when a webServer service is present. */
-export function installInboxWeb(ctx: any, getPool: () => EmailPool): void {
+export function installInboxWeb(ctx: any, getPool: () => EmailPool, settingsScope: any): void {
   ctx.inject(['webServer'], (webCtx: any) => {
     webCtx.effect(() => {
       const dispose = webCtx.webServer.register({
         kind: 'prefix',
         path: INBOX_ROUTE,
-        handler: (req: any, res: any) => handleInbox(getPool, req, res),
+        handler: (req: any, res: any) => handleInbox(getPool, settingsScope, ctx, req, res),
       })
       return () => dispose()
     }, 'dsh-email: inbox web route')
@@ -160,79 +499,511 @@ function inboxPageHtml(): string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dsh-email 收件箱</title>
+<title>WeBank 邮箱 - 收件箱</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
-* { box-sizing: border-box; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
-body { margin: 0; display: flex; flex-direction: column; font: 14px/1.6 -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; color: #1f2328; background: #f6f8fa; }
-header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #fff; border-bottom: 1px solid #d8dee4; flex: none; }
-header h1 { font-size: 16px; margin: 0 8px 0 0; }
-select, button { font: inherit; }
-select { padding: 4px 8px; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; max-width: 220px; }
-button { padding: 4px 12px; border: 1px solid #d0d7de; border-radius: 6px; background: #f6f8fa; cursor: pointer; }
-button:hover:not(:disabled) { background: #eaeef2; }
-button:disabled { opacity: .5; cursor: default; }
-label.chk { display: flex; align-items: center; gap: 4px; user-select: none; }
-#banner { display: none; margin: 12px; padding: 10px 14px; border: 1px solid #d4a72c; background: #fff8c5; border-radius: 6px; }
-main { flex: 1; display: flex; min-height: 0; }
-#folders { width: 170px; flex: none; overflow: auto; padding: 8px; border-right: 1px solid #d8dee4; background: #fff; }
-#folders button { display: block; width: 100%; text-align: left; margin-bottom: 2px; border: none; background: none; border-radius: 6px; padding: 6px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#folders button:hover { background: #eef1f4; }
-#folders button.active { background: #0969da; color: #fff; }
-#listPane { width: 360px; flex: none; display: flex; flex-direction: column; border-right: 1px solid #d8dee4; background: #fff; min-height: 0; }
+body {
+  font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #333; background: #f4f6f9; display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+}
+button, select, input { font: inherit; }
+
+/* 顶栏 */
+.header {
+  height: 52px; background: #f0f3f8; border-bottom: 1px solid #e1e6ed;
+  display: flex; align-items: center; justify-content: space-between; padding: 0 16px; flex-shrink: 0;
+}
+.logo-area { display: flex; align-items: center; width: 210px; }
+.logo-title { font-size: 20px; font-weight: bold; color: #1262d6; display: flex; align-items: center; gap: 6px; }
+.logo-title .logo-sub { font-size: 10px; color: #1262d6; font-weight: normal; line-height: 1.1; }
+.search-bar { flex: 1; max-width: 480px; position: relative; margin: 0 16px; }
+.search-bar input {
+  width: 100%; height: 32px; background: #e2e7ef; border: 1px solid transparent;
+  border-radius: 16px; padding: 0 16px 0 36px; font-size: 13px; outline: none; color: #333;
+}
+.search-bar input:focus { background: #fff; border-color: #0084ff; }
+.search-bar i { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: #8a97a8; }
+.user-area { display: flex; align-items: center; gap: 12px; font-size: 12px; color: #555; }
+
+/* 主体 */
+.main-container { display: flex; flex: 1; overflow: hidden; }
+
+/* 左侧栏 */
+.sidebar {
+  width: 210px; background: #ebf0f5; border-right: 1px solid #dce2e9;
+  display: flex; flex-direction: column; padding: 12px 8px; overflow-y: auto; flex-shrink: 0;
+}
+.btn-compose {
+  background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; border: none;
+  border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 500;
+  display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; margin-bottom: 12px;
+  box-shadow: 0 2px 4px rgba(0,86,224,0.2);
+}
+.btn-compose:hover { filter: brightness(1.05); }
+.menu-group { margin-bottom: 16px; }
+.menu-title { font-size: 11px; color: #8a97a8; padding: 4px 12px; }
+.menu-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 12px; border-radius: 6px; color: #333; cursor: pointer;
+  font-size: 13px; border: none; background: none; width: 100%; text-align: left;
+}
+.menu-item:hover { background: #dedede; }
+.menu-item.active { background: #dce7f5; color: #0056e0; font-weight: 600; }
+.menu-item-left { display: flex; align-items: center; gap: 10px; overflow: hidden; }
+.menu-item-left i { width: 16px; text-align: center; color: #666; flex-shrink: 0; }
+.menu-item.active .menu-item-left i { color: #0056e0; }
+.menu-item-left span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.count-badge { font-size: 11px; color: #0056e0; font-weight: bold; flex-shrink: 0; }
+.sidebar-footer { margin-top: auto; padding: 8px 12px; font-size: 11px; color: #8a97a8; }
+
+/* 中间邮件列表 */
+.list-pane {
+  width: 320px; flex: none; display: flex; flex-direction: column;
+  border-right: 1px solid #d8dee4; background: #fff; min-height: 0;
+}
+.list-toolbar {
+  height: 40px; padding: 0 12px; border-bottom: 1px solid #e8ecef; display: flex;
+  align-items: center; gap: 12px; flex-shrink: 0; font-size: 12px; color: #555;
+}
+.list-toolbar label { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+.list-toolbar button {
+  padding: 4px 10px; border: 1px solid #dcdfe6; border-radius: 4px; background: #f2f4f7;
+  color: #333; cursor: pointer; display: flex; align-items: center; gap: 4px;
+}
+.list-toolbar button:hover { background: #e6e9f0; }
 #messages { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
-#messages li { padding: 10px 12px; border-bottom: 1px solid #eaeef2; cursor: pointer; }
+#messages li { padding: 10px 14px; border-bottom: 1px solid #eef1f4; cursor: pointer; }
 #messages li:hover { background: #f6f8fa; }
-#messages li.active { background: #ddf4ff; }
-#messages li.unread .subject { font-weight: 700; }
-#messages li.hint { color: #8b949e; cursor: default; }
-#messages .subject { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#messages .meta { color: #57606a; font-size: 12px; display: flex; gap: 8px; margin-top: 2px; }
+#messages li.active { background: #dce7f5; }
+#messages li.unread .subject { font-weight: 700; color: #0056e0; }
+#messages li.unread::before { content: ""; display: inline-block; width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; margin-right: 6px; vertical-align: 2px; }
+#messages li.hint { color: #8a97a8; cursor: default; text-align: center; }
+#messages .subject { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; }
+#messages .meta { color: #8a97a8; font-size: 11px; display: flex; gap: 8px; margin-top: 3px; }
 #messages .meta .from { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { display: inline-block; font-size: 11px; color: #0969da; border: 1px solid #0969da; border-radius: 8px; padding: 0 6px; margin-left: 6px; vertical-align: 1px; }
-#more { margin: 8px; flex: none; }
-#reader { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-#readerHead { padding: 12px 16px; background: #fff; border-bottom: 1px solid #d8dee4; flex: none; }
-#readerHead h2 { font-size: 15px; margin: 0 0 6px; }
-#readerHead .kv { color: #57606a; font-size: 12px; margin: 1px 0; word-break: break-all; }
-#placeholder { color: #8b949e; padding: 24px; }
-#toolbar { padding: 6px 12px; background: #fff; border-bottom: 1px solid #eaeef2; display: flex; gap: 8px; align-items: center; font-size: 12px; color: #57606a; flex: none; }
+.badge { font-size: 10px; color: #fff; background: #ff6b6b; border-radius: 3px; padding: 1px 5px; margin-left: 6px; }
+#more { margin: 8px; flex: none; padding: 6px; border: 1px solid #dcdfe6; border-radius: 4px; background: #f2f4f7; cursor: pointer; }
+#more:hover { background: #e6e9f0; }
+
+/* 右侧阅读区 */
+.reader { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #fff; }
+.reader-toolbar {
+  height: 42px; padding: 0 16px; border-bottom: 1px solid #e8ecef; display: flex;
+  align-items: center; justify-content: space-between; flex-shrink: 0; background: #fff;
+}
+.reader-toolbar .left { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #666; }
+.reader-toolbar .left button {
+  padding: 4px 10px; border: 1px solid #dcdfe6; border-radius: 4px; background: #f2f4f7;
+  cursor: pointer; display: flex; align-items: center; gap: 4px; color: #333;
+}
+.reader-toolbar .left button:hover { background: #e6e9f0; }
+.reader-toolbar .left button:disabled { opacity: .5; cursor: default; }
+.reader-toolbar .right { font-size: 12px; color: #8a97a8; }
+
+#readerHead { padding: 16px 24px; border-bottom: 1px solid #f0f0f0; flex-shrink: 0; }
+#readerHead h2 { font-size: 16px; font-weight: bold; color: #111; margin-bottom: 10px; }
+#readerHead .meta-row { display: flex; align-items: flex-start; gap: 12px; }
+#readerHead .avatar-tag {
+  width: 28px; height: 28px; background: #ff6b6b; color: #fff; border-radius: 4px;
+  display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: bold; flex-shrink: 0;
+}
+#readerHead .meta-info { flex: 1; font-size: 12px; line-height: 1.7; }
+#readerHead .sender-line { color: #333; }
+#readerHead .sender-name { font-weight: bold; }
+#readerHead .sender-email { color: #888; font-weight: normal; }
+#readerHead .recipient-line { color: #888; }
+#readerHead .kv { color: #888; }
+#placeholder { color: #8a97a8; padding: 40px; text-align: center; }
 #frame { flex: 1; border: none; width: 100%; background: #fff; min-height: 0; }
-#attach { padding: 8px 12px; background: #fff; border-top: 1px solid #eaeef2; font-size: 13px; flex: none; }
-#attach a { color: #0969da; text-decoration: none; margin-right: 12px; }
-footer { flex: none; padding: 4px 16px; background: #fff; border-top: 1px solid #d8dee4; color: #8b949e; font-size: 12px; }
+#attach { padding: 10px 24px; background: #fff; border-top: 1px solid #f0f0f0; font-size: 12px; flex-shrink: 0; }
+#attach a { color: #1262d6; text-decoration: none; margin-right: 14px; display: inline-flex; align-items: center; gap: 4px; }
+#attach a:hover { text-decoration: underline; }
+
+/* banner */
+#banner {
+  display: none; margin: 0; padding: 8px 16px; border: 1px solid #d4a72c;
+  background: #fff8c5; color: #7a5400; font-size: 12px; flex-shrink: 0;
+}
+
+/* 登录视图 */
+#loginView {
+  flex: 1; display: none; align-items: center; justify-content: center;
+  background: #f4f6f9; padding: 24px;
+}
+#loginView.active { display: flex; }
+#loginForm {
+  width: 100%; max-width: 360px; background: #fff; border: 1px solid #e1e6ed;
+  border-radius: 8px; padding: 32px 28px; box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+}
+#loginForm h2 { margin: 0 0 8px; font-size: 18px; color: #1262d6; }
+#loginForm .subtitle { font-size: 12px; color: #8a97a8; margin-bottom: 20px; }
+#loginForm label { display: block; margin: 12px 0 4px; font-size: 13px; color: #555; }
+#loginForm input {
+  width: 100%; height: 34px; padding: 0 10px; border: 1px solid #d0d7de;
+  border-radius: 6px; font: inherit; box-sizing: border-box; outline: none;
+}
+#loginForm input:focus { border-color: #0084ff; }
+#loginForm button {
+  margin-top: 20px; width: 100%; height: 36px; border: none; border-radius: 6px;
+  background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; cursor: pointer;
+  font: inherit; font-weight: 500;
+}
+#loginForm button:hover:not(:disabled) { filter: brightness(1.05); }
+#loginForm button:disabled { opacity: .5; cursor: default; }
+#loginMsg { margin-top: 12px; font-size: 12px; color: #cf222e; min-height: 16px; }
+
+/* AI 助理侧栏 */
+.ai-panel {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: 375px; display: flex; flex-direction: column;
+  border-left: 1px solid #dce2e9; background: #f7f8fa; flex-shrink: 0; min-height: 0;
+  z-index: 20; box-shadow: -4px 0 12px rgba(0,0,0,0.08);
+}
+.ai-panel-header {
+  height: 44px; padding: 0 14px; border-bottom: 1px solid #e8ecef;
+  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; background: #fff;
+}
+.ai-panel-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #1a1a1a; }
+.ai-panel-close {
+  border: none; background: none; cursor: pointer; color: #666; font-size: 13px;
+  width: 24px; height: 24px; border-radius: 4px; display: flex; align-items: center; justify-content: center;
+}
+.ai-panel-close:hover { background: #eef1f5; color: #333; }
+#aiFrame { flex: 1; border: none; width: 100%; min-height: 0; background: #f7f8fa; }
+
+/* 智能分类 */
+.plus-btn {
+  border: none; background: none; color: #8a97a8; cursor: pointer;
+  width: 18px; height: 18px; border-radius: 4px; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 11px;
+}
+.plus-btn:hover { background: #dce2e9; color: #0056e0; }
+.menu-title { display: flex; align-items: center; justify-content: space-between; }
+.title-toggle {
+  display: flex; align-items: center; gap: 6px; cursor: pointer;
+  flex: 1; user-select: none;
+}
+.title-toggle i { font-size: 10px; transition: transform .15s; width: 10px; }
+#labelsGroup.expanded .title-toggle i { transform: rotate(90deg); }
+.label-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #0056e0;
+  flex-shrink: 0; display: inline-block;
+}
+.menu-item .label-delete {
+  border: none; background: none; color: #aaa; cursor: pointer;
+  padding: 2px 4px; font-size: 12px; opacity: 0; transition: opacity .15s;
+}
+.menu-item:hover .label-delete { opacity: 1; }
+.menu-item .label-delete:hover { color: #cf222e; }
+
+dialog#labelModal {
+  border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
+  width: 360px; box-shadow: 0 4px 20px rgba(0,0,0,0.12); color: #333;
+}
+dialog#composeModal {
+  border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
+  width: 820px; max-width: 95vw; max-height: 92vh; overflow: auto;
+  margin: auto; box-shadow: 0 4px 24px rgba(0,0,0,0.16); color: #333;
+}
+dialog#composeModal::backdrop { background: rgba(0,0,0,0.35); }
+dialog#composeModal .compose-body { padding: 16px 20px; }
+dialog#composeModal .compose-topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid #eee;
+}
+dialog#composeModal .compose-topbar .actions { display: flex; gap: 6px; }
+dialog#composeModal .btn-c {
+  padding: 4px 12px; border-radius: 3px; border: 1px solid #d9d9d9;
+  background: #fff; cursor: pointer; font-size: 12px; color: #333;
+}
+dialog#composeModal .btn-c.primary { background: #3b7bff; color: #fff; border-color: #3b7bff; }
+dialog#composeModal .btn-c.primary:hover { background: #2a69ea; }
+dialog#composeModal .topbar-right { display: flex; gap: 14px; align-items: center; color: #666; font-size: 12px; }
+dialog#composeModal .topbar-right span { cursor: pointer; }
+dialog#composeModal .form-row {
+  display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0;
+}
+dialog#composeModal .form-label { width: 60px; color: #666; font-size: 12px; }
+dialog#composeModal .form-input {
+  flex: 1; border: none; outline: none; font-size: 13px; padding: 2px 0; background: transparent;
+}
+dialog#composeModal .placeholder-tip { color: #aaa; font-size: 11px; margin-left: 8px; }
+dialog#composeModal .sub-tools {
+  display: flex; align-items: center; gap: 14px; padding: 8px 0; color: #666; font-size: 12px;
+}
+dialog#composeModal .sub-tools .divider { width: 1px; height: 12px; background: #e8e8e8; }
+dialog#composeModal .editor-container {
+  border: 1px solid #e8e8e8; border-radius: 4px; margin-top: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+}
+dialog#composeModal .editor-toolbar {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  padding: 6px 10px; background: #fcfcfc; border-bottom: 1px solid #e8e8e8; font-size: 13px;
+}
+dialog#composeModal .tb-item {
+  cursor: pointer; padding: 3px 5px; border-radius: 2px; display: inline-flex;
+  align-items: center; gap: 2px; color: #555; user-select: none;
+}
+dialog#composeModal .tb-item:hover { background: #ececec; }
+dialog#composeModal .tb-item.active { background: #dce7f5; color: #0056e0; }
+dialog#composeModal .tb-select {
+  border: 1px solid #d9d9d9; border-radius: 2px; padding: 2px 4px; background: #fff; font-size: 12px; outline: none;
+}
+dialog#composeModal .tool-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 26px; min-width: 26px; padding: 0 5px; border-radius: 2px;
+  cursor: pointer; color: #555; font-size: 13px; user-select: none;
+}
+dialog#composeModal .tool-btn:hover { background: #ececec; }
+dialog#composeModal .tool-btn.active { background: #dcdcdc; }
+dialog#composeModal .tool-select {
+  height: 24px; border: 1px solid #d0d0d0; background: #fff;
+  border-radius: 2px; padding: 0 4px; font-size: 12px; color: #333; outline: none; cursor: pointer;
+}
+dialog#composeModal .tb-divider { width: 1px; height: 14px; background: #e8e8e8; }
+dialog#composeModal .editor-content {
+  height: 280px; padding: 12px 15px; outline: none; overflow-y: auto; font-size: 13px; line-height: 1.6;
+}
+dialog#composeModal .compose-footer {
+  display: flex; align-items: center; gap: 12px; margin-top: 10px; color: #666; font-size: 12px;
+}
+dialog#composeModal .compose-footer .from-info { color: #666; }
+dialog#composeModal .compose-footer .from-info strong { color: #333; }
+dialog#composeModal .compose-footer .footer-actions { margin-left: auto; display: flex; gap: 8px; }
+dialog#composeModal #composeMsg { color: #cf222e; font-size: 12px; min-height: 14px; margin-top: 6px; }
+}
+dialog#labelModal::backdrop { background: rgba(0,0,0,0.3); }
+dialog#labelModal form { padding: 20px 24px; }
+dialog#labelModal h3 { margin: 0 0 12px; font-size: 16px; color: #1262d6; }
+dialog#labelModal label { display: block; margin: 10px 0 4px; font-size: 13px; color: #555; }
+dialog#labelModal input[type=text] {
+  width: 100%; height: 32px; padding: 0 10px; border: 1px solid #d0d7de;
+  border-radius: 6px; font: inherit; box-sizing: border-box; outline: none;
+}
+dialog#labelModal input[type=text]:focus { border-color: #0084ff; }
+dialog#labelModal .color-row { display: flex; gap: 6px; margin-top: 4px; }
+dialog#labelModal .color-swatch {
+  width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
+  border: 2px solid transparent;
+}
+dialog#labelModal .color-swatch.active { border-color: #333; }
+dialog#labelModal .actions { margin-top: 20px; display: flex; justify-content: flex-end; gap: 8px; }
+dialog#labelModal button {
+  padding: 6px 14px; border-radius: 6px; font: inherit; cursor: pointer; border: 1px solid #d0d7de;
+}
+dialog#labelModal button.btn-cancel { background: #f2f4f7; color: #555; }
+dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; border: none; }
 </style>
 </head>
 <body>
-<header>
-  <h1>收件箱</h1>
-  <select id="account" title="账号"></select>
-  <label class="chk"><input type="checkbox" id="unreadOnly"> 只看未读</label>
-  <button id="refresh" type="button">刷新</button>
-</header>
+
+<div class="header">
+  <div class="logo-area">
+    <div class="logo-title">
+      <i class="fa-solid fa-envelope" style="font-size:18px"></i>
+      <span>WeBank<span class="logo-sub">邮箱</span></span>
+    </div>
+  </div>
+  <div class="search-bar">
+    <i class="fa-solid fa-magnifying-glass"></i>
+    <input type="text" placeholder="搜索邮件（暂未启用）" disabled>
+  </div>
+  <div class="user-area">
+    <i class="fa-solid fa-arrow-rotate-right" id="refresh" style="cursor:pointer; color:#555" title="刷新"></i>
+    <button id="aiAssistantBtn" type="button" title="AI 助理" style="border:none;background:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:6px;font-size:13px;color:#333">
+      <img src="${INBOX_ROUTE}/api/asset/emailAI.png" alt="AI助理" style="width:24px;height:24px;border-radius:50%">
+      <span>AI助理</span>
+    </button>
+  </div>
+</div>
+
 <div id="banner"></div>
-<main>
-  <nav id="folders"></nav>
-  <section id="listPane">
+
+<div id="loginView">
+  <form id="loginForm">
+    <h2>登录 WeBank 邮箱</h2>
+    <div class="subtitle">请输入邮箱地址与授权码（非登录密码）</div>
+    <input type="hidden" id="loginProvider" value="webank">
+    <label for="loginUser">邮箱地址</label>
+    <input id="loginUser" type="email" autocomplete="username" placeholder="user@webank.com">
+    <label for="loginPass">授权码</label>
+    <input id="loginPass" type="password" autocomplete="current-password" placeholder="邮箱授权码">
+    <button id="loginBtn" type="submit">登录</button>
+    <div id="loginMsg"></div>
+  </form>
+</div>
+
+<div class="main-container" id="mainView">
+  <div class="sidebar">
+    <button class="btn-compose" id="composeBtn" type="button" title="写信">
+      <i class="fa-solid fa-pen-to-square"></i> 写信
+    </button>
+    <div class="menu-group">
+      <div class="menu-title">文件夹</div>
+      <nav id="folders"></nav>
+    </div>
+    <div class="menu-group" id="labelsGroup">
+      <div class="menu-title">
+        <span class="title-toggle" id="labelsToggle" title="展开/折叠">
+          <i class="fa-solid fa-chevron-right"></i>
+          智能分类
+        </span>
+        <button id="addLabelBtn" class="plus-btn" type="button" title="新建分类标签"><i class="fa-solid fa-plus"></i></button>
+      </div>
+      <nav id="labels" style="display:none"></nav>
+    </div>
+  </div>
+
+  <div class="list-pane">
+    <div class="list-toolbar">
+      <label class="chk"><input type="checkbox" id="unreadOnly"> 只看未读</label>
+      <span style="flex:1"></span>
+    </div>
     <ul id="messages"></ul>
     <button id="more" type="button" style="display:none">加载更多</button>
-  </section>
-  <article id="reader">
-    <div id="readerHead"><div id="placeholder">在左侧选择一封邮件阅读。本页为只读视图，阅读不会把邮件标记为已读。</div></div>
-    <div id="toolbar">
-      <button id="remoteBtn" type="button" style="display:none">加载远程图片</button>
-      <span>远程图片默认拦截（防追踪）；脚本一律禁用。</span>
+  </div>
+
+  <div class="reader">
+    <div class="reader-toolbar">
+      <div class="left">
+        <button id="remoteBtn" type="button" style="display:none"><i class="fa-solid fa-image"></i> 加载远程图片</button>
+        <span>远程图片默认拦截 · 脚本一律禁用</span>
+      </div>
+      <div class="right" id="readerMeta"></div>
     </div>
+    <div id="readerHead"><div id="placeholder"><i class="fa-regular fa-envelope-open" style="font-size:32px; color:#d0d7de"></i><div style="margin-top:8px">在左侧选择一封邮件阅读</div></div></div>
     <iframe id="frame" sandbox="" referrerpolicy="no-referrer" title="邮件正文"></iframe>
     <div id="attach" style="display:none"></div>
-  </article>
-</main>
-<footer>只读收件箱：发信 / 回复请让 agent 执行（走审批确认）。-- dsh-email</footer>
+  </div>
+
+  <aside id="aiPanel" class="ai-panel" style="display:none">
+    <div class="ai-panel-header">
+      <div class="ai-panel-title">
+        <img src="${INBOX_ROUTE}/api/asset/emailAI.png" alt="AI" style="width:20px;height:20px;border-radius:50%">
+        <span>AI 助理</span>
+      </div>
+      <button id="aiPanelClose" type="button" class="ai-panel-close" title="收起">
+        <i class="fa-solid fa-chevron-right"></i>
+      </button>
+    </div>
+    <iframe id="aiFrame" src="${INBOX_ROUTE}/api/asset/assistant.html" title="AI 助理" referrerpolicy="no-referrer"></iframe>
+  </aside>
+</div>
+
+<dialog id="labelModal">
+  <form id="labelForm" method="dialog">
+    <h3 id="labelModalTitle">新建分类标签</h3>
+    <label for="labelName">标签名称</label>
+    <input id="labelName" type="text" placeholder="例如：告警" maxlength="20">
+    <label for="labelKeywords">关键词（逗号分隔，主题含任一关键词即归类）</label>
+    <input id="labelKeywords" type="text" placeholder="例如：告警,监控,IMS">
+    <label>颜色</label>
+    <div class="color-row" id="labelColors"></div>
+    <input id="labelId" type="hidden">
+    <input id="labelColor" type="hidden">
+    <div class="actions">
+      <button type="button" class="btn-cancel" id="labelCancel">取消</button>
+      <button type="submit" class="btn-primary" id="labelSave">保存</button>
+    </div>
+    <div id="labelMsg" style="margin-top:8px;font-size:12px;color:#cf222e;min-height:16px"></div>
+  </form>
+</dialog>
+
+<dialog id="composeModal">
+  <form id="composeForm" method="dialog">
+    <div class="compose-topbar">
+      <div class="actions">
+        <button type="button" class="btn-c primary" id="composeSend"><i class="fa-solid fa-paper-plane"></i> 发送</button>
+        <button type="button" class="btn-c" id="composePreview">预览</button>
+        <button type="button" class="btn-c" id="composeDraft">存草稿</button>
+        <button type="button" class="btn-c" id="composeCancel">取消</button>
+      </div>
+      <div class="topbar-right">
+        <span id="composeCcToggle">抄送</span>
+      </div>
+    </div>
+    <div class="compose-body">
+      <div class="form-row">
+        <span class="form-label">收件人：</span>
+        <input id="composeTo" type="text" class="form-input" placeholder="发给多人时地址请以分号或逗号隔开">
+        <span class="placeholder-tip">发给多人时地址请以分号或逗号隔开</span>
+      </div>
+      <div class="form-row" id="composeCcRow" style="display:none">
+        <span class="form-label">抄 送：</span>
+        <input id="composeCc" type="text" class="form-input" placeholder="抄送地址">
+      </div>
+      <div class="form-row">
+        <span class="form-label">主 题：</span>
+        <input id="composeSubject" type="text" class="form-input" placeholder="邮件主题">
+      </div>
+      <div class="sub-tools">
+        <span class="tb-item" id="composeAttachBtn" style="cursor:pointer;color:#3b7bff">📎 添加附件</span>
+        <input type="file" id="composeAttachInput" multiple style="display:none">
+        <span class="divider"></span>
+        <input id="composeAttachments" type="text" class="form-input" placeholder="附件路径，多个用逗号分隔" style="flex:1" readonly>
+      </div>
+      <div class="editor-container">
+        <div class="editor-toolbar">
+          <span class="tool-btn" data-cmd="undo" title="撤销">↶</span>
+          <span class="tool-btn" data-cmd="redo" title="重做">↷</span>
+          <span class="tool-btn" data-cmd="removeFormat" title="清除格式">🧹</span>
+          <span class="tb-divider"></span>
+          <select class="tool-select" id="composeFontName" title="字体">
+            <option value="">默认字体</option>
+            <option value="Arial">Arial</option>
+            <option value="PingFang SC">PingFang SC</option>
+            <option value="Microsoft YaHei">Microsoft YaHei</option>
+            <option value="SimSun">SimSun</option>
+            <option value="Helvetica">Helvetica</option>
+            <option value="Georgia">Georgia</option>
+          </select>
+          <select class="tool-select" id="composeFontSize" title="字号">
+            <option value="">字号</option>
+            <option value="2">小</option>
+            <option value="3">正常</option>
+            <option value="4">中</option>
+            <option value="5">大</option>
+            <option value="6">特大</option>
+          </select>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="bold" title="加粗" style="font-weight:bold">B</span>
+          <span class="tool-btn" data-cmd="italic" title="斜体" style="font-style:italic;font-family:Georgia,serif">I</span>
+          <span class="tool-btn" data-cmd="underline" title="下划线" style="text-decoration:underline">U</span>
+          <span class="tool-btn" data-cmd="strikeThrough" title="删除线" style="text-decoration:line-through">S</span>
+          <span class="tb-divider"></span>
+          <input type="color" class="tool-select" id="composeForeColor" title="文字颜色" style="width:24px;height:24px;padding:0;cursor:pointer;border:1px solid #d0d0d0;border-radius:2px">
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="justifyLeft" title="左对齐">⬅</span>
+          <span class="tool-btn" data-cmd="justifyCenter" title="居中">↔</span>
+          <span class="tool-btn" data-cmd="justifyRight" title="右对齐">➡</span>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="insertUnorderedList" title="无序列表">•</span>
+          <span class="tool-btn" data-cmd="insertOrderedList" title="有序列表">1.</span>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="outdent" title="减少缩进">⇤</span>
+          <span class="tool-btn" data-cmd="indent" title="增加缩进">⇥</span>
+        </div>
+        <div id="composeEditor" class="editor-content" contenteditable="true"></div>
+      </div>
+      <div class="compose-footer">
+        <div class="from-info">发件人：<strong id="composeFrom">加载中…</strong></div>
+        <div class="footer-actions">
+          <button type="button" class="btn-c primary" id="composeSend2"><i class="fa-solid fa-paper-plane"></i> 发送</button>
+          <button type="button" class="btn-c" id="composeCancel2">取消</button>
+        </div>
+      </div>
+      <div id="composeMsg"></div>
+    </div>
+  </form>
+</dialog>
+
 <script>
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: false };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: false };
+  var LABEL_COLORS = ['#0056e0', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -248,6 +1019,61 @@ footer { flex: none; padding: 4px 16px; background: #fff; border-top: 1px solid 
     if (!iso) return '';
     var d = new Date(iso);
     return isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false });
+  }
+  function folderIcon(f) {
+    var s = f.specialUse || '';
+    if (s.indexOf('Inbox') >= 0) return 'fa-regular fa-folder-open';
+    if (s.indexOf('Sent') >= 0) return 'fa-regular fa-paper-plane';
+    if (s.indexOf('Drafts') >= 0) return 'fa-regular fa-file-lines';
+    if (s.indexOf('Trash') >= 0) return 'fa-regular fa-trash-can';
+    if (s.indexOf('Junk') >= 0 || s.indexOf('Spam') >= 0) return 'fa-regular fa-circle-xmark';
+    if (s.indexOf('Archive') >= 0) return 'fa-regular fa-box-archive';
+    return 'fa-regular fa-folder';
+  }
+  function avatarLetter(text) {
+    var t = String(text || '?').trim();
+    return t.charAt(0).toUpperCase();
+  }
+  // webank/Coremail 把中文姓名塞进 local part：lakerli(李可)@webank.com。
+  // 这种格式可能出现在 name 字段（"lakerli(李可)"）或 address 字段里。
+  // 两处都提取括号内中文作为显示名，剩余 local part 拼回 address。
+  function extractChinese(text) {
+    if (!text) return '';
+    var m = String(text).match(/\\(([^)]+)\\)/);
+    return m ? m[1].trim() : '';
+  }
+  function parseAddr(raw) {
+    var addr = raw || {};
+    var a = String(addr.address || '').trim();
+    var rawName = String(addr.name || '').trim();
+    var name = '';
+    if (rawName) {
+      var n = extractChinese(rawName);
+      name = n || rawName;
+    }
+    if (!name && a) {
+      var inAddr = extractChinese(a);
+      if (inAddr) {
+        name = inAddr;
+        a = a.replace(/\\([^)]+\\)/, '');
+      }
+    }
+    return { name: name, address: a };
+  }
+  var FOLDER_LABELS = {
+    'INBOX': '收件箱',
+    'Sent': '已发送', 'Sent Messages': '已发送', '已发送': '已发送',
+    'Drafts': '草稿箱', 'Draft': '草稿箱', '草稿': '草稿箱', '草稿箱': '草稿箱',
+    'Trash': '已删除', 'Deleted': '已删除', 'Deleted Messages': '已删除', '已删除': '已删除',
+    'Junk': '垃圾邮件', 'Spam': '垃圾邮件', '垃圾邮件': '垃圾邮件', 'Bulk Mail': '垃圾邮件',
+    'Archive': '归档', 'All Mail': '全部邮件',
+    'Notes': '备忘录', 'Flagged': '星标',
+  };
+  function folderLabel(f) {
+    var key = String(f.name || f.path || '').trim();
+    if (FOLDER_LABELS[key]) return FOLDER_LABELS[key];
+    if (key.toUpperCase() === 'INBOX') return '收件箱';
+    return f.name || f.path;
   }
   function qs(params) {
     var u = new URLSearchParams();
@@ -268,28 +1094,28 @@ footer { flex: none; padding: 4px 16px; background: #fff; border-top: 1px solid 
       });
     });
   }
+  var bannerTimer = null;
   function showBanner(msg) {
     var b = document.getElementById('banner');
     b.textContent = msg;
     b.style.display = 'block';
+    if (bannerTimer) clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(function () {
+      b.style.display = 'none';
+      bannerTimer = null;
+    }, 3000);
   }
 
   function loadFolders() {
     return api('/api/folders', { account: state.account }).then(function (value) {
       var accounts = value.accounts || [];
-      var sel = document.getElementById('account');
-      if (sel.children.length !== accounts.length) {
-        sel.innerHTML = '';
-        accounts.forEach(function (name) {
-          var o = document.createElement('option');
-          o.value = name;
-          o.textContent = name;
-          sel.appendChild(o);
-        });
-      }
       if (!state.account && accounts.length > 0) state.account = accounts[0];
-      sel.value = state.account || '';
-      var folders = value.folders || [];
+      var folders = (value.folders || []).slice();
+      folders.sort(function (a, b) {
+        var av = /病毒|Virus|Infected/i.test(a.path) ? 1 : 0;
+        var bv = /病毒|Virus|Infected/i.test(b.path) ? 1 : 0;
+        return av - bv;
+      });
       var known = folders.some(function (f) { return f.path === state.folder; });
       if (!known) {
         var inbox = folders.filter(function (f) {
@@ -302,16 +1128,35 @@ footer { flex: none; padding: 4px 16px; background: #fff; border-top: 1px solid 
       folders.forEach(function (f) {
         var btn = document.createElement('button');
         btn.type = 'button';
+        btn.className = 'menu-item';
         btn.dataset.path = f.path;
-        btn.textContent = f.name || f.path;
         btn.title = f.path + (f.specialUse ? ' [' + f.specialUse + ']' : '') + (f.subscribed ? '' : '（未订阅）');
-        if (f.path === state.folder) btn.className = 'active';
+        if (f.path === state.folder) btn.classList.add('active');
+        var left = document.createElement('div');
+        left.className = 'menu-item-left';
+        var icon = document.createElement('i');
+        icon.className = folderIcon(f);
+        var label = document.createElement('span');
+        label.textContent = folderLabel(f);
+        left.appendChild(icon);
+        left.appendChild(label);
+        btn.appendChild(left);
+        var unread = (typeof f.unread === 'number') ? f.unread : -1;
+        if (unread > 0) {
+          var c = document.createElement('span');
+          c.className = 'count-badge';
+          c.textContent = unread;
+          c.title = '未读 ' + unread;
+          btn.appendChild(c);
+        }
         btn.onclick = function () {
-          if (state.folder === f.path) return;
+          if (state.view === 'folder' && state.folder === f.path) return;
+          state.view = 'folder';
           state.folder = f.path;
           state.uid = null;
           state.offset = 0;
           markActiveFolder();
+          markActiveLabel();
           loadList();
         };
         nav.appendChild(btn);
@@ -319,114 +1164,252 @@ footer { flex: none; padding: 4px 16px; background: #fff; border-top: 1px solid 
     });
   }
   function markActiveFolder() {
-    var btns = document.querySelectorAll('#folders button');
+    var btns = document.querySelectorAll('#folders .menu-item');
     for (var i = 0; i < btns.length; i++) {
-      btns[i].classList.toggle('active', btns[i].dataset.path === state.folder);
+      btns[i].classList.toggle('active', state.view === 'folder' && btns[i].dataset.path === state.folder);
     }
+  }
+  function markActiveLabel() {
+    var btns = document.querySelectorAll('#labels .menu-item');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle('active', state.view === 'label' && btns[i].dataset.id === state.labelId);
+    }
+  }
+
+  function loadLabels() {
+    return fetch(BASE + '/api/labels').then(function (res) {
+      return res.json().catch(function () { return null; });
+    }).then(function (data) {
+      var labels = (data && data.ok && data.value) ? data.value : [];
+      var nav = document.getElementById('labels');
+      nav.innerHTML = '';
+      labels.forEach(function (l) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'menu-item';
+        btn.dataset.id = l.id;
+        if (state.view === 'label' && state.labelId === l.id) btn.classList.add('active');
+        var left = document.createElement('div');
+        left.className = 'menu-item-left';
+        var dot = document.createElement('span');
+        dot.className = 'label-dot';
+        dot.style.background = l.color || LABEL_COLORS[0];
+        var span = document.createElement('span');
+        span.textContent = l.name;
+        left.appendChild(dot);
+        left.appendChild(span);
+        btn.appendChild(left);
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'label-delete';
+        del.title = '删除标签';
+        del.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        del.onclick = function (ev) {
+          ev.stopPropagation();
+          if (!confirm('删除标签 "' + l.name + '"？')) return;
+          fetch(BASE + '/api/labels/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: l.id }),
+          }).then(function (res) {
+            return res.json().catch(function () { return null; });
+          }).then(function (d) {
+            if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
+            if (state.view === 'label' && state.labelId === l.id) {
+              state.view = 'folder';
+              state.labelId = '';
+              state.uid = null;
+              state.offset = 0;
+              loadList();
+            }
+            loadLabels();
+          }).catch(function (err) { showBanner(err.message); });
+        };
+        btn.appendChild(del);
+        btn.onclick = function () {
+          if (state.view === 'label' && state.labelId === l.id) return;
+          state.view = 'label';
+          state.labelId = l.id;
+          state.uid = null;
+          state.offset = 0;
+          markActiveFolder();
+          markActiveLabel();
+          loadList();
+        };
+        nav.appendChild(btn);
+      });
+    }).catch(function (err) { showBanner(err.message); });
+  }
+
+  function openLabelModal(label) {
+    var modal = document.getElementById('labelModal');
+    var title = document.getElementById('labelModalTitle');
+    var idInput = document.getElementById('labelId');
+    var nameInput = document.getElementById('labelName');
+    var kwInput = document.getElementById('labelKeywords');
+    var colorInput = document.getElementById('labelColor');
+    var msg = document.getElementById('labelMsg');
+    msg.textContent = '';
+    if (label) {
+      title.textContent = '编辑分类标签';
+      idInput.value = label.id;
+      nameInput.value = label.name;
+      kwInput.value = (label.keywords || []).join(',');
+      colorInput.value = label.color || LABEL_COLORS[0];
+    } else {
+      title.textContent = '新建分类标签';
+      idInput.value = '';
+      nameInput.value = '';
+      kwInput.value = '';
+      colorInput.value = LABEL_COLORS[0];
+    }
+    var colors = document.getElementById('labelColors');
+    colors.innerHTML = '';
+    LABEL_COLORS.forEach(function (c) {
+      var sw = document.createElement('div');
+      sw.className = 'color-swatch' + (colorInput.value === c ? ' active' : '');
+      sw.style.background = c;
+      sw.onclick = function () {
+        colorInput.value = c;
+        var children = colors.children;
+        for (var i = 0; i < children.length; i++) children[i].classList.remove('active');
+        sw.classList.add('active');
+      };
+      colors.appendChild(sw);
+    });
+    modal.showModal();
+    nameInput.focus();
   }
 
   function rowEl(m) {
     var li = document.createElement('li');
     li.dataset.uid = String(m.uid);
+    if (m.folder) li.dataset.folder = m.folder;
     if (!m.seen) li.classList.add('unread');
     if (m.uid === state.uid) li.classList.add('active');
     var subject = document.createElement('span');
     subject.className = 'subject';
     subject.textContent = m.subject || '(无主题)';
-    li.appendChild(subject);
     if (m.hasAttachments) {
       var badge = document.createElement('span');
       badge.className = 'badge';
-      badge.textContent = '附件';
-      li.appendChild(badge);
+      badge.innerHTML = '<i class="fa-solid fa-paperclip"></i>';
+      subject.appendChild(badge);
     }
+    li.appendChild(subject);
     var meta = document.createElement('div');
     meta.className = 'meta';
     var from = document.createElement('span');
     from.className = 'from';
-    from.textContent = (m.from || []).map(function (a) { return a.name || a.address; }).filter(Boolean).join(', ') || '(未知)';
+    from.textContent = (m.from || []).map(function (a) {
+      var p = parseAddr(a);
+      return p.name || p.address;
+    }).filter(Boolean).join(', ') || '(未知)';
     var date = document.createElement('span');
     date.textContent = fmtDate(m.date);
     meta.appendChild(from);
     meta.appendChild(date);
     li.appendChild(meta);
-    li.onclick = function () { openMessage(m.uid); };
+    li.onclick = function () { openMessage(m.uid, m.folder); };
     return li;
   }
 
   function loadList() {
     var listEl = document.getElementById('messages');
     if (state.offset === 0) listEl.innerHTML = '';
-    return api('/api/messages', {
-      account: state.account, folder: state.folder, limit: state.limit,
-      offset: state.offset, unreadOnly: state.unreadOnly,
-    }).then(function (value) {
+    var params;
+    if (state.view === 'label') {
+      params = { account: state.account, label: state.labelId, limit: state.limit };
+    } else {
+      params = { account: state.account, folder: state.folder, limit: state.limit, offset: state.offset, unreadOnly: state.unreadOnly };
+    }
+    return api('/api/messages', params).then(function (value) {
       (value.messages || []).forEach(function (m) { listEl.appendChild(rowEl(m)); });
       var shown = listEl.children.length;
       var more = document.getElementById('more');
-      more.style.display = shown < value.count ? '' : 'none';
+      more.style.display = (state.view === 'label' || shown >= value.count) ? 'none' : '';
       if (shown === 0) {
         var hint = document.createElement('li');
         hint.className = 'hint';
-        hint.textContent = value.count === 0 ? '此文件夹没有邮件' : '没有更多邮件';
+        hint.textContent = value.count === 0 ? (state.view === 'label' ? '此标签没有匹配邮件' : '此文件夹没有邮件') : '没有更多邮件';
         listEl.appendChild(hint);
       }
     }).catch(function (err) { showBanner(err.message); });
   }
 
-  function loadFrame() {
+  function loadFrame(folder) {
     var frame = document.getElementById('frame');
     frame.src = BASE + '/api/message.html' + qs({
-      account: state.account, folder: state.folder, uid: state.uid, images: state.imagesAllowed,
+      account: state.account, folder: folder, uid: state.uid, images: state.imagesAllowed,
     });
     var btn = document.getElementById('remoteBtn');
-    btn.textContent = state.imagesAllowed ? '已允许远程图片' : '加载远程图片';
+    btn.innerHTML = state.imagesAllowed ? '<i class="fa-solid fa-check"></i> 已允许远程图片' : '<i class="fa-solid fa-image"></i> 加载远程图片';
     btn.disabled = state.imagesAllowed;
   }
 
-  function openMessage(uid) {
+  function openMessage(uid, folder) {
+    var effFolder = folder || state.folder;
     state.uid = uid;
     state.imagesAllowed = false;
     var items = document.getElementById('messages').children;
+    var flipped = false;
     for (var i = 0; i < items.length; i++) {
-      items[i].classList.toggle('active', Number(items[i].dataset.uid) === uid);
+      var li = items[i];
+      var match = Number(li.dataset.uid) === uid;
+      li.classList.toggle('active', match);
+      if (match && li.classList.contains('unread')) {
+        li.classList.remove('unread');
+        flipped = true;
+      }
+    }
+    if (flipped) {
+      fetch(BASE + '/api/mark-seen', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: state.account, folder: effFolder, uid: uid }),
+      }).catch(function () { /* best-effort; UI already updated */ });
     }
     var head = document.getElementById('readerHead');
     head.innerHTML = '<div id="placeholder">加载中…</div>';
-    api('/api/message', { account: state.account, folder: state.folder, uid: uid }).then(function (v) {
-      var from = (v.from || []).map(function (a) { return a.name ? a.name + ' <' + a.address + '>' : a.address; }).join(', ') || '(未知)';
-      var to = (v.to || []).map(function (a) { return a.address; }).join(', ');
-      var cc = (v.cc || []).map(function (a) { return a.address; }).join(', ');
+    api('/api/message', { account: state.account, folder: effFolder, uid: uid }).then(function (v) {
+      var fromParsed = parseAddr((v.from || [])[0]);
+      var fromName = fromParsed.name || fromParsed.address || '(未知)';
+      var to = (v.to || []).map(function (a) {
+        var p = parseAddr(a);
+        return p.name ? p.name + ' <' + p.address + '>' : p.address;
+      }).join(', ');
+      var cc = (v.cc || []).map(function (a) {
+        var p = parseAddr(a);
+        return p.name ? p.name + ' <' + p.address + '>' : p.address;
+      }).join(', ');
+      document.getElementById('readerMeta').textContent = fmtDate(v.date);
       head.innerHTML =
         '<h2>' + esc(v.subject || '(无主题)') + '</h2>' +
-        '<div class="kv">发件人：' + esc(from) + '</div>' +
-        '<div class="kv">收件人：' + esc(to) + '</div>' +
-        (cc ? '<div class="kv">抄送：' + esc(cc) + '</div>' : '') +
-        '<div class="kv">时间：' + esc(fmtDate(v.date)) + '</div>';
+        '<div class="meta-row">' +
+          '<div class="avatar-tag">' + esc(avatarLetter(fromName)) + '</div>' +
+          '<div class="meta-info">' +
+            '<div class="sender-line"><span class="sender-name">' + esc(fromName) + '</span> <span class="sender-email">&lt;' + esc(fromParsed.address) + '&gt;</span></div>' +
+            '<div class="recipient-line">收件人：' + esc(to) + (cc ? ' · 抄送：' + esc(cc) : '') + '</div>' +
+          '</div>' +
+        '</div>';
       var attach = document.getElementById('attach');
       attach.innerHTML = '';
       (v.attachments || []).forEach(function (a, i) {
         var link = document.createElement('a');
-        link.href = BASE + '/api/attachment' + qs({ account: state.account, folder: state.folder, uid: uid, index: i });
-        link.textContent = a.filename + '（' + fmtSize(a.size) + '）';
+        link.href = BASE + '/api/attachment' + qs({ account: state.account, folder: effFolder, uid: uid, index: i });
+        link.innerHTML = '<i class="fa-solid fa-file"></i> ' + esc(a.filename) + '（' + fmtSize(a.size) + '）';
         attach.appendChild(link);
       });
       attach.style.display = (v.attachments && v.attachments.length > 0) ? '' : 'none';
       document.getElementById('remoteBtn').style.display = '';
-      loadFrame();
+      loadFrame(effFolder);
     }).catch(function (err) {
       head.innerHTML = '<div id="placeholder">' + esc(err.message) + '</div>';
     });
   }
 
-  document.getElementById('account').onchange = function () {
-    state.account = this.value;
-    state.folder = '';
-    state.uid = null;
-    state.offset = 0;
-    loadFolders().then(loadList);
-  };
   document.getElementById('unreadOnly').onchange = function () {
+    if (state.view === 'label') { this.checked = false; return; }
     state.unreadOnly = this.checked;
     state.offset = 0;
     loadList();
@@ -435,18 +1418,301 @@ footer { flex: none; padding: 4px 16px; background: #fff; border-top: 1px solid 
     state.offset = 0;
     state.uid = null;
     loadFolders().then(loadList);
+    loadLabels();
   };
+  setInterval(function () {
+    var compose = document.getElementById('composeModal');
+    if (compose && compose.open) return;
+    if (document.getElementById('loginView') && document.getElementById('loginView').classList.contains('active')) return;
+    loadList();
+  }, 60000);
   document.getElementById('more').onclick = function () {
     state.offset += state.limit;
     loadList();
   };
   document.getElementById('remoteBtn').onclick = function () {
     state.imagesAllowed = true;
-    loadFrame();
+    loadFrame(state.view === 'label' ? (document.querySelector('#messages li.active') ? document.querySelector('#messages li.active').dataset.folder : '') : state.folder);
+  };
+  document.getElementById('addLabelBtn').onclick = function () {
+    openLabelModal(null);
+  };
+  document.getElementById('labelsToggle').onclick = function () {
+    var g = document.getElementById('labelsGroup');
+    var expanded = g.classList.toggle('expanded');
+    document.getElementById('labels').style.display = expanded ? '' : 'none';
+    if (expanded) loadLabels();
+  };
+  document.getElementById('aiAssistantBtn').onclick = function () {
+    document.getElementById('aiPanel').style.display = '';
+  };
+  document.getElementById('aiPanelClose').onclick = function () {
+    document.getElementById('aiPanel').style.display = 'none';
+  };
+  var composeEditor = document.getElementById('composeEditor');
+  function exec(cmd, val) {
+    document.execCommand(cmd, false, val || null);
+    composeEditor.focus();
+    updateTbActive();
+  }
+  function updateTbActive() {
+    var items = document.querySelectorAll('#composeModal .tool-btn[data-cmd]');
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var cmd = it.dataset.cmd;
+      try {
+        var on = document.queryCommandState(cmd);
+        it.classList.toggle('active', !!on);
+      } catch { /* ignore */ }
+    }
+  }
+  document.querySelectorAll('#composeModal .tool-btn[data-cmd]').forEach(function (el) {
+    el.onclick = function () { exec(el.dataset.cmd); };
+  });
+  document.getElementById('composeFontName').onchange = function () { exec('fontName', this.value); this.value = ''; };
+  document.getElementById('composeFontSize').onchange = function () { exec('fontSize', this.value); this.value = ''; };
+  document.getElementById('composeForeColor').onchange = function () { exec('foreColor', this.value); };
+  composeEditor.onkeyup = updateTbActive;
+  composeEditor.onmouseup = updateTbActive;
+
+  document.getElementById('composeCcToggle').onclick = function () {
+    var row = document.getElementById('composeCcRow');
+    row.style.display = row.style.display === 'none' ? '' : 'none';
   };
 
-  loadFolders().then(loadList).catch(function (err) {
-    showBanner(err.message + '（若尚未配置账号，请到 dsh 设置 -> 邮件 (dsh-email) 填写并保存）');
+  function openPreview() {
+    var to = document.getElementById('composeTo').value.trim();
+    var cc = document.getElementById('composeCc').value.trim();
+    var subject = document.getElementById('composeSubject').value.trim();
+    var html = composeEditor.innerHTML;
+    var text = composeEditor.innerText.trim();
+    var w = window.open('', '_blank', 'width=720,height=600');
+    if (!w) { document.getElementById('composeMsg').textContent = '预览窗口被浏览器拦截'; return; }
+    var from = document.getElementById('composeFrom').textContent || '';
+    w.document.open();
+    w.document.write('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>邮件预览</title>' +
+      '<style>body{font:13px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#333;padding:24px;max-width:680px;margin:0 auto}' +
+      '.hd{border-bottom:1px solid #eee;padding-bottom:12px;margin-bottom:16px} .hd h2{font-size:16px;margin:0 0 8px}' +
+      '.row{color:#666;font-size:12px;margin:2px 0} .row b{color:#333;font-weight:600} .body{margin-top:12px;min-height:200px}</style></head><body>' +
+      '<div class="hd"><h2>' + esc(subject || '(无主题)') + '</h2>' +
+      '<div class="row"><b>发件人：</b>' + esc(from) + '</div>' +
+      '<div class="row"><b>收件人：</b>' + esc(to || '(空)') + '</div>' +
+      (cc ? '<div class="row"><b>抄送：</b>' + esc(cc) + '</div>' : '') +
+      '</div><div class="body">' + (html || '<pre style="white-space:pre-wrap;font:inherit;margin:0">' + esc(text) + '</pre>') + '</div></body></html>');
+    w.document.close();
+  }
+  document.getElementById('composePreview').onclick = openPreview;
+
+  function saveDraft() {
+    var draft = {
+      to: document.getElementById('composeTo').value,
+      cc: document.getElementById('composeCc').value,
+      subject: document.getElementById('composeSubject').value,
+      html: composeEditor.innerHTML,
+      attachments: document.getElementById('composeAttachments').value,
+      savedAt: new Date().toISOString(),
+    };
+    try {
+      localStorage.setItem('dsh-email-draft', JSON.stringify(draft));
+      showBanner('草稿已保存到本地（' + new Date().toLocaleString('zh-CN', { hour12: false }) + '）');
+    } catch (e) {
+      document.getElementById('composeMsg').textContent = '草稿保存失败：' + (e && e.message || e);
+    }
+  }
+  function loadDraft() {
+    try {
+      var raw = localStorage.getItem('dsh-email-draft');
+      if (!raw) return;
+      var d = JSON.parse(raw);
+      document.getElementById('composeTo').value = d.to || '';
+      document.getElementById('composeCc').value = d.cc || '';
+      document.getElementById('composeSubject').value = d.subject || '';
+      composeEditor.innerHTML = d.html || '';
+      document.getElementById('composeAttachments').value = d.attachments || '';
+      if (d.cc) document.getElementById('composeCcRow').style.display = '';
+    } catch { /* ignore */ }
+  }
+  document.getElementById('composeDraft').onclick = saveDraft;
+
+  var attachInput = document.getElementById('composeAttachInput');
+  var attachField = document.getElementById('composeAttachments');
+  document.getElementById('composeAttachBtn').onclick = function () { attachInput.click(); };
+  attachInput.onchange = function () {
+    var files = attachInput.files;
+    if (!files || files.length === 0) return;
+    var msg = document.getElementById('composeMsg');
+    msg.textContent = '上传中…';
+    var fd = new FormData();
+    for (var i = 0; i < files.length; i++) fd.append('file', files[i], files[i].name);
+    fetch(BASE + '/api/upload', { method: 'POST', body: fd }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (d) {
+        if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
+        return d.value;
+      });
+    }).then(function (v) {
+      var existing = attachField.value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+      (v.paths || []).forEach(function (p) { existing.push(p); });
+      attachField.value = existing.join(', ');
+      msg.textContent = '';
+      attachInput.value = '';
+    }).catch(function (err) {
+      msg.textContent = err.message;
+      attachInput.value = '';
+    });
+  };
+
+  function loadFromInfo() {
+    fetch(BASE + '/api/me' + qs({ account: state.account })).then(function (res) {
+      return res.json().catch(function () { return null; });
+    }).then(function (d) {
+      if (d && d.ok && d.value) {
+        document.getElementById('composeFrom').textContent = d.value.user || d.value.account;
+      } else {
+        document.getElementById('composeFrom').textContent = state.account || 'default';
+      }
+    }).catch(function () {
+      document.getElementById('composeFrom').textContent = state.account || 'default';
+    });
+  }
+
+  function doSend() {
+    var to = document.getElementById('composeTo').value.trim();
+    var cc = document.getElementById('composeCc').value.trim();
+    var subject = document.getElementById('composeSubject').value.trim();
+    var html = composeEditor.innerHTML.trim();
+    var text = composeEditor.innerText.trim();
+    var atts = document.getElementById('composeAttachments').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    var msg = document.getElementById('composeMsg');
+    if (!to) { msg.textContent = '请填写收件人'; return; }
+    if (!subject && !text) { msg.textContent = '主题和正文不能同时为空'; return; }
+    msg.textContent = '';
+    var btns = [document.getElementById('composeSend'), document.getElementById('composeSend2')];
+    btns.forEach(function (b) { b.disabled = true; b.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 发送中…'; });
+    fetch(BASE + '/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        account: state.account, to: to, cc: cc, subject: subject,
+        text: text || undefined, html: html || undefined, attachments: atts,
+      }),
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (d) {
+        if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
+        return d.value;
+      });
+    }).then(function (v) {
+      btns.forEach(function (b) { b.disabled = false; b.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送'; });
+      document.getElementById('composeModal').close();
+      showBanner('已发送至 ' + (v.accepted || []).join(', ') + '（' + v.messageId + '）');
+      resetCompose();
+    }).catch(function (err) {
+      msg.textContent = err.message;
+      btns.forEach(function (b) { b.disabled = false; b.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送'; });
+    });
+  }
+  function resetCompose() {
+    document.getElementById('composeTo').value = '';
+    document.getElementById('composeCc').value = '';
+    document.getElementById('composeSubject').value = '';
+    document.getElementById('composeAttachments').value = '';
+    composeEditor.innerHTML = '';
+    document.getElementById('composeCcRow').style.display = 'none';
+    document.getElementById('composeMsg').textContent = '';
+  }
+  document.getElementById('composeBtn').onclick = function () {
+    loadFromInfo();
+    loadDraft();
+    document.getElementById('composeModal').showModal();
+    document.getElementById('composeTo').focus();
+  };
+  document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').close(); };
+  document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').close(); };
+  document.getElementById('composeSend').onclick = doSend;
+  document.getElementById('composeSend2').onclick = doSend;
+  document.getElementById('composeForm').onsubmit = function (e) { e.preventDefault(); doSend(); };
+  document.getElementById('labelCancel').onclick = function () {
+    document.getElementById('labelModal').close();
+  };
+  document.getElementById('labelForm').onsubmit = function (e) {
+    e.preventDefault();
+    var id = document.getElementById('labelId').value || ('lbl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6));
+    var name = document.getElementById('labelName').value.trim();
+    var kws = document.getElementById('labelKeywords').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    var color = document.getElementById('labelColor').value || LABEL_COLORS[0];
+    var msg = document.getElementById('labelMsg');
+    if (!name) { msg.textContent = '请填写标签名称'; return; }
+    msg.textContent = '';
+    fetch(BASE + '/api/labels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id, name: name, keywords: kws, color: color }),
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (d) {
+        if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
+      });
+    }).then(function () {
+      document.getElementById('labelModal').close();
+      loadLabels();
+    }).catch(function (err) { msg.textContent = err.message; });
+  };
+
+  function showLogin() {
+    document.getElementById('loginView').classList.add('active');
+    document.getElementById('mainView').style.display = 'none';
+    document.getElementById('banner').style.display = 'none';
+  }
+  function showMain() {
+    document.getElementById('loginView').classList.remove('active');
+    document.getElementById('mainView').style.display = '';
+  }
+
+  document.getElementById('loginForm').onsubmit = function (e) {
+    e.preventDefault();
+    var provider = document.getElementById('loginProvider').value;
+    var user = document.getElementById('loginUser').value.trim();
+    var password = document.getElementById('loginPass').value;
+    var msg = document.getElementById('loginMsg');
+    var btn = document.getElementById('loginBtn');
+    if (!user) { msg.textContent = '请填写邮箱地址'; return; }
+    if (!password) { msg.textContent = '请填写授权码'; return; }
+    msg.textContent = '';
+    btn.disabled = true;
+    btn.textContent = '登录中…';
+    fetch(BASE + '/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: provider, user: user, password: password }),
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        if (!res.ok || !data || !data.ok) {
+          throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
+        }
+      });
+    }).then(function () {
+      btn.textContent = '已保存，加载中…';
+      showMain();
+      loadFolders().then(loadList).then(loadLabels).catch(function (err) {
+        showBanner(err.message);
+      });
+    }).catch(function (err) {
+      msg.textContent = err.message;
+      btn.disabled = false;
+      btn.textContent = '登录';
+    });
+  };
+
+  loadFolders().then(function () {
+    showMain();
+    loadList();
+    loadLabels();
+  }).catch(function (err) {
+    var msg = String(err && err.message || err);
+    if (msg.indexOf('未配置') >= 0 || msg.indexOf('未填写') >= 0 || msg.indexOf('user') >= 0 || msg.indexOf('password') >= 0 || msg.indexOf('host') >= 0) {
+      showLogin();
+    } else {
+      showMain();
+      showBanner(msg);
+    }
   });
 })();
 </script>

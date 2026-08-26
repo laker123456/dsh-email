@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邮箱AI助理</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+    }
+
+    body {
+      background-color: #f4f5f7;
+      color: #333;
+    }
+
+    .container {
+      width: 100%;
+      height: 100vh;
+      background: #f7f8fa;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      padding: 12px 16px;
+      overflow: hidden;
+    }
+
+    /* 顶部导航 */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .icon-btn {
+      font-size: 18px;
+      color: #555;
+      cursor: pointer;
+      background: none;
+      border: none;
+    }
+
+    .title {
+      font-size: 18px;
+      font-weight: 600;
+      color: #1a1a1a;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .usage-tag {
+      background: #e8ecef;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 13px;
+      color: #666;
+    }
+
+    .usage-tag span {
+      color: #6c5ce7;
+      margin-left: 4px;
+      cursor: pointer;
+    }
+
+    .ai-logo {
+      font-weight: bold;
+      color: #6c5ce7;
+      font-size: 20px;
+    }
+
+    /* 侧边功能栏 */
+    .side-tools {
+      position: absolute;
+      right: 16px;
+      top: 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      color: #888;
+      font-size: 18px;
+    }
+
+    /* 个人信息 */
+    .profile-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      margin-top: 10px;
+      margin-bottom: 20px;
+    }
+
+    .avatar-wrapper {
+      width: 84px;
+      height: 84px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #a8c0ff, #3f2b96);
+      padding: 3px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .avatar {
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: #fff;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    /* 示例头像（SVG占位） */
+    .avatar img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .profile-title {
+      font-size: 18px;
+      font-weight: bold;
+      margin-top: 12px;
+      color: #1a1a1a;
+    }
+
+    .profile-subtitle {
+      font-size: 13px;
+      color: #888;
+      margin-top: 4px;
+    }
+
+    /* 快捷指令列表 */
+    .quick-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex: 1;
+    }
+
+    .action-card {
+      background: #ffffff;
+      padding: 12px 16px;
+      border-radius: 12px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+      font-size: 14px;
+      color: #333;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .action-card:hover {
+      background: #f0f0f5;
+    }
+
+    .refresh-btn {
+      text-align: center;
+      color: #666;
+      font-size: 13px;
+      margin: 12px 0;
+      cursor: pointer;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* 底部操作区 */
+    .bottom-area {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 8px;
+    }
+
+    .tab-item {
+      background: #ffffff;
+      padding: 8px 12px;
+      border-radius: 20px;
+      font-size: 13px;
+      color: #333;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+      position: relative;
+    }
+
+    .tab-item.active::before {
+      content: '';
+      position: absolute;
+      top: 6px;
+      left: 10px;
+      width: 6px;
+      height: 6px;
+      background: #ff4d4f;
+      border-radius: 50%;
+    }
+
+    .dropdown-btn {
+      background: #ffffff;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 12px;
+      color: #666;
+    }
+
+    .input-box {
+      background: #ffffff;
+      border-radius: 16px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.03);
+    }
+
+    .placeholder-text {
+      color: #aaa;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .input-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .selector {
+      background: #f0f2f5;
+      padding: 6px 12px;
+      border-radius: 14px;
+      font-size: 12px;
+      color: #666;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .input-center {
+      font-size: 13px;
+      color: #888;
+    }
+
+    .send-btn {
+      color: #888;
+      font-size: 16px;
+      cursor: pointer;
+    }
+
+    .footer-tips {
+      text-align: center;
+      font-size: 11px;
+      color: #aaa;
+      margin-bottom: 8px;
+    }
+
+    .footer-tips span {
+      color: #888;
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <!-- 顶部导航 -->
+    <div class="header">
+      <div class="header-left">
+        <button class="icon-btn">❯</button>
+        <span class="title">AI助理</span>
+      </div>
+      <div class="header-right">
+        <div class="usage-tag">5次 <span>续费</span></div>
+        <div class="ai-logo">AI</div>
+      </div>
+    </div>
+
+    <!-- 侧边功能图标 -->
+    <div class="side-tools">
+      <div>🛠️</div>
+      <div>👤</div>
+      <div>👥</div>
+    </div>
+
+    <!-- 菜单图标 -->
+    <div style="font-size: 18px; color: #555; margin-top: 4px;">☰</div>
+
+    <!-- 个人信息 -->
+    <div class="profile-section">
+      <div class="avatar-wrapper">
+        <div class="avatar">
+          <!-- 默认占位图 -->
+          <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Felix" alt="Avatar">
+        </div>
+      </div>
+      <div class="profile-title">邮箱AI助理</div>
+      <div class="profile-subtitle">我是您的专属AI助理</div>
+    </div>
+
+    <!-- 快捷指令列表 -->
+    <div class="quick-actions">
+      <div class="action-card">
+        <span>✉️</span> 显示超过3天未回复的邮件
+      </div>
+      <div class="action-card">
+        <span>📅</span> 帮我生成最近一周的周报
+      </div>
+      <div class="action-card">
+        <span>📌</span> 基于最近1封邮件需要我采取哪些...
+      </div>
+      <div class="action-card">
+        <span>📫</span> 将最近5封邮件标为未读
+      </div>
+      <div class="action-card">
+        <span>📊</span> 将最近3封邮件的重点用表格输出
+      </div>
+    </div>
+
+    <!-- 底部提示文字 -->
+    <div class="footer-tips">
+      AI生成仅供参考，请遵守《服务条款》
+    </div>
+
+    <!-- 底部输入与操作 -->
+    <div class="bottom-area">
+      <div class="tabs">
+        <div class="tab-item active">
+          <span>🔍</span> AI搜索和问答
+        </div>
+        <div class="tab-item">
+          <span>⚙️</span> 整理最近邮件
+        </div>
+        <div class="dropdown-btn">∨</div>
+      </div>
+
+      <div class="input-box">
+        <div class="placeholder-text">
+          ✦✦ 写邮件、提炼要点、搜索或询问邮件的任何问题
+        </div>
+        <div class="input-toolbar">
+          <div class="selector">请选择 ∨</div>
+          <div class="input-center">怎么使用？</div>
+          <div class="send-btn">➔</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>

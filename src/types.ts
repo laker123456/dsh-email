@@ -15,6 +15,8 @@ export interface ListedMessage {
   flagged: boolean
   size: number
   hasAttachments: boolean
+  /** Source folder; set when the message comes from a cross-folder (label) query. */
+  folder?: string
 }
 
 /** One attachment of a read message (metadata only). */
@@ -73,6 +75,10 @@ export interface EmailFolderRow {
   path: string
   specialUse: string
   subscribed: boolean
+  /** Total message count (from IMAP STATUS), -1 when not fetched. */
+  total: number
+  /** Unseen count (from IMAP STATUS), -1 when not fetched. */
+  unread: number
 }
 
 export interface EmailFoldersResult {

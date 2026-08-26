@@ -8,6 +8,7 @@ import { flattenAddresses, parseRawMessage, sanitizeFilename } from './parse.js'
 import type {
   EmailAttachmentMeta,
   EmailAttachmentResult,
+  EmailFolderRow,
   EmailFoldersResult,
   EmailListResult,
   EmailReadResult,
@@ -288,6 +289,41 @@ export class EmailPool {
     })
   }
 
+  /**
+   * Cross-folder listing for the label view: fetch the most recent messages
+   * from every subscribed folder, keep those whose subject contains any of
+   * the given keywords (case-insensitive), merge by date desc, and cap at
+   * `limit`. Each returned message carries its source `folder` so the caller
+   * can open it later (uid is not unique across folders).
+   */
+  async listByLabel(accountName: string | undefined, keywords: string[], limit: number): Promise<EmailListResult> {
+    const name = this.resolveName(accountName)
+    const folderRows = await this.folders(name, true)
+    const lowered = keywords.map(k => k.toLowerCase().trim()).filter(k => k !== '')
+    const collected: ListedMessage[] = []
+    for (const row of folderRows.folders) {
+      try {
+        const result = await this.list(name, row.path, limit, 0, false)
+        for (const m of result.messages) {
+          if (lowered.length === 0) continue
+          const subj = String(m.subject || '').toLowerCase()
+          if (lowered.some(k => subj.includes(k))) {
+            collected.push({ ...m, folder: row.path })
+          }
+        }
+      } catch {
+        // A single folder failing (permissions, missing) must not abort the rest.
+      }
+    }
+    collected.sort((a, b) => {
+      const ta = Date.parse(a.date || '') || 0
+      const tb = Date.parse(b.date || '') || 0
+      return tb - ta
+    })
+    const messages = collected.slice(0, limit)
+    return { account: name, count: collected.length, folder: '', messages }
+  }
+
   async search(accountName: string | undefined, query: string, folder: string, limit: number): Promise<EmailSearchResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
@@ -395,18 +431,51 @@ export class EmailPool {
     })
   }
 
+  /** Mark a message as seen (\\Seen) via a read-write IMAP connection. */
+  async markSeen(accountName: string | undefined, uid: number, folder: string): Promise<void> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    // The pooled connection opens mailboxes read-only (so listing/listing
+    // never accidentally flips flags); STORE needs a read-write mailbox, so
+    // open a short-lived dedicated connection.
+    const client = this.createImap(cfg)
+    try {
+      await client.connect()
+      await client.mailboxOpen(folderName, { readOnly: false })
+      await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true })
+    } catch (error) {
+      throw this.normalizeImapError(error, folderName)
+    } finally {
+      try { await client.logout() } catch { /* ignore */ }
+    }
+  }
+
   async folders(accountName: string | undefined, subscribedOnly: boolean): Promise<EmailFoldersResult> {
     const name = this.resolveName(accountName)
     return this.withImap(name, null, async (client) => {
       const list = await client.list()
-      const folders = list
-        .filter(row => !subscribedOnly || row.subscribed !== false)
-        .map(row => ({
+      const rows = list.filter(row => !subscribedOnly || row.subscribed !== false)
+      const folders: EmailFolderRow[] = []
+      for (const row of rows) {
+        let total = -1
+        let unread = -1
+        try {
+          const status = await client.status(row.path, { messages: true, unseen: true })
+          total = status?.messages ?? -1
+          unread = status?.unseen ?? -1
+        } catch {
+          // STATUS can fail on special/useless mailboxes (e.g. nosel); -1 means "unknown"
+        }
+        folders.push({
           name: row.name ?? row.path,
           path: row.path,
           specialUse: row.specialUse ?? '',
           subscribed: row.subscribed !== false,
-        }))
+          total,
+          unread,
+        })
+      }
       return { account: name, folders }
     })
   }
@@ -452,18 +521,21 @@ export class EmailPool {
     })
   }
 
-  async send(accountName: string | undefined, to: string, subject: string, text: string | undefined, cc: string | undefined, attachmentPaths: string[] | undefined): Promise<EmailSendResult> {
+  async send(accountName: string | undefined, to: string, subject: string, text: string | undefined, html: string | undefined, cc: string | undefined, bcc: string | undefined, attachmentPaths: string[] | undefined): Promise<EmailSendResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
     const attachments = await validateAttachmentPaths(attachmentPaths ?? [], this.settings.maxAttachmentBytes)
-    const info = await this.transporter(name, cfg).sendMail({
+    const opts: Record<string, unknown> = {
       from: cfg.user,
       to,
-      cc,
       subject,
       text: text ?? '',
       attachments,
-    })
+    }
+    if (cc) opts.cc = cc
+    if (bcc) opts.bcc = bcc
+    if (html) opts.html = html
+    const info = await this.transporter(name, cfg).sendMail(opts)
     return {
       account: name,
       messageId: info.messageId,

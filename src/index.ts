@@ -258,7 +258,7 @@ export function apply(ctx: any, config: Config = {}): void {
   })
 
   installEmailSettingsWeb(ctx, new EmailSettingsBackend(ctx, settingsScope, config))
-  installInboxWeb(ctx, getPool)
+  installInboxWeb(ctx, getPool, settingsScope)
 
   ctx.tools.register({
     name: 'email_list',
@@ -352,7 +352,9 @@ export function apply(ctx: any, config: Config = {}): void {
         args.to.trim(),
         args.subject.trim(),
         typeof args.text === 'string' ? args.text : undefined,
+        undefined,
         typeof args.cc === 'string' && args.cc.trim() !== '' ? args.cc.trim() : undefined,
+        undefined,
         normalizeAttachmentPaths(args.attachments),
       )
     },
