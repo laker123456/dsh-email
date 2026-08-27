@@ -288,28 +288,6 @@ export class EmailPool {
       uids.reverse()
       const window = uids.slice(offset, offset + limit)
       const messages = await this.fetchListed(client, window)
-      // 单独 SEARCH FLAGGED 拿权威 flagged uid 集合：readOnly mailbox 上
-      // fetchAll 返回的 flags 可能是 session 缓存，pin/unpin 后不会立即刷新，
-      // 导致置顶排序失效。SEARCH 走服务器端索引，总是当前值。
-      let flaggedSet = new Set<number>()
-      try {
-        const found = await client.search({ flagged: true }, { uid: true })
-        const fids = found === false ? [] : (found as number[])
-        flaggedSet = new Set(fids)
-        for (const m of messages) m.flagged = flaggedSet.has(m.uid)
-      } catch { /* 退回 fetchListed 的 flags */ }
-      if (flaggedSet.size > 0) {
-        try {
-          messages.sort((a, b) => {
-            const af = flaggedSet.has(a.uid) ? 1 : 0
-            const bf = flaggedSet.has(b.uid) ? 1 : 0
-            if (af !== bf) return bf - af
-            const ta = Date.parse(a.date || '') || 0
-            const tb = Date.parse(b.date || '') || 0
-            return tb - ta
-          })
-        } catch { /* 排序失败不影响展示 */ }
-      }
       return { account: name, count: scopeCount, folder: folderName, messages }
     })
   }

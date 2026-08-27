@@ -839,8 +839,6 @@ button, select, input { font: inherit; }
 #messages li.active { background: #dce7f5; }
 #messages li.unread .subject { font-weight: 700; color: #0056e0; }
 #messages li.unread .subject::before { content: ""; display: inline-block; width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-#messages li.flagged { background: #fff8e6; border-left: 3px solid #f0a020; padding-left: 9px; }
-#messages li.flagged .subject::after { content: "📌"; margin-left: 6px; font-size: 12px; }
 #messages li.hint { color: #8a97a8; cursor: default; text-align: center; }
 #messages .subject { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; }
 #messages .meta { color: #8a97a8; font-size: 11px; display: flex; gap: 8px; margin-top: 3px; }
@@ -1095,7 +1093,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   <div class="ctx-item" data-act="reply"><i class="fa-solid fa-reply"></i> 回复邮件</div>
   <div class="ctx-item" data-act="todo"><i class="fa-solid fa-list-check"></i> 设为待办</div>
   <div class="ctx-item" data-act="seen"><i class="fa-solid fa-envelope-open"></i> <span class="ctx-seen-label">设为已读</span></div>
-  <div class="ctx-item" data-act="pin"><i class="fa-solid fa-thumbtack"></i> <span class="ctx-pin-label">置顶邮件</span></div>
   <div class="ctx-item ctx-danger" data-act="delete"><i class="fa-solid fa-trash"></i> 删除邮件</div>
 </div>
 
@@ -1573,7 +1570,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         e.preventDefault();
         var menu = document.getElementById('ctxMenu');
         menu.querySelector('.ctx-seen-label').textContent = '移除待办';
-        menu.querySelector('.ctx-pin-label').textContent = '置顶邮件';
         menu.dataset.uid = String(t.uid);
         menu.dataset.folder = t.folder;
         menu.dataset.todoId = t.id;
@@ -1581,7 +1577,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         menu.dataset.from = t.from || '';
         menu.dataset.date = t.date || '';
         menu.dataset.seen = '1';
-        menu.dataset.flagged = '0';
+        menu.dataset.flagged = '1';
         menu.dataset.isTodo = '1';
         menu.style.display = 'block';
         var x = e.clientX, y = e.clientY;
@@ -1729,7 +1725,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     }).filter(Boolean).join(',');
     li.dataset.date = m.date || '';
     if (!m.seen) li.classList.add('unread');
-    if (m.flagged) li.classList.add('flagged');
     if (m.uid === state.uid) li.classList.add('active');
     var subject = document.createElement('span');
     subject.className = 'subject';
@@ -1767,7 +1762,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     var seen = li.dataset.seen === '1';
     var flagged = li.dataset.flagged === '1';
     menu.querySelector('.ctx-seen-label').textContent = seen ? '设为未读' : '设为已读';
-    menu.querySelector('.ctx-pin-label').textContent = flagged ? '取消置顶' : '置顶邮件';
     menu.dataset.uid = li.dataset.uid;
     menu.dataset.folder = li.dataset.folder;
     menu.dataset.seen = li.dataset.seen;
@@ -1814,6 +1808,12 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         if (d && d.ok) { showBanner('已移除待办'); loadTodoCount(); }
         else showBanner((d && d.error && d.error.message) || '移除失败');
       });
+      if (flagged) {
+        fetch(BASE + '/api/pin', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: false }),
+        });
+      }
       return;
     }
     if (act === 'todo') {
@@ -1825,7 +1825,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
           if (d && d.ok) { showBanner('已移除待办'); loadTodoCount(); }
           else showBanner((d && d.error && d.error.message) || '移除失败');
         });
-        if (!flagged) {
+        if (flagged) {
           fetch(BASE + '/api/pin', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: false }),
@@ -1843,11 +1843,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
           fetch(BASE + '/api/pin', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: true }),
-          }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
-            if (d && d.ok) {
-              var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
-              if (li) { li.classList.add('flagged'); li.dataset.flagged = '1'; }
-            }
           });
         }
       }
@@ -1865,22 +1860,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
             li.dataset.seen = seen ? '0' : '1';
           }
         } else showBanner((d && d.error && d.error.message) || '切换失败');
-      });
-      return;
-    }
-    if (act === 'pin') {
-      fetch(BASE + '/api/pin', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: !flagged }),
-      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
-        if (d && d.ok) {
-          showBanner(flagged ? '已取消置顶' : '已置顶');
-          if (state.view === 'folder') {
-            loadList();
-          } else if (state.view === 'todo') {
-            loadTodoList(null, state.unreadOnly);
-          }
-        } else showBanner((d && d.error && d.error.message) || '置顶失败');
       });
       return;
     }
