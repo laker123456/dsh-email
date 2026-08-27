@@ -2363,6 +2363,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     document.getElementById('loginView').classList.add('active');
     document.getElementById('mainView').style.display = 'none';
     document.getElementById('banner').style.display = 'none';
+    var sb = document.querySelector('.search-bar'); if (sb) sb.style.display = 'none';
+    var ua = document.querySelector('.user-area'); if (ua) ua.style.display = 'none';
     fetch(BASE + '/api/me').then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
       if (d && d.ok && d.value && d.value.user) {
         var u = document.getElementById('loginUser');
@@ -2373,6 +2375,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   function showMain() {
     document.getElementById('loginView').classList.remove('active');
     document.getElementById('mainView').style.display = '';
+    var sb = document.querySelector('.search-bar'); if (sb) sb.style.display = '';
+    var ua = document.querySelector('.user-area'); if (ua) ua.style.display = '';
   }
 
   document.getElementById('loginForm').onsubmit = function (e) {
