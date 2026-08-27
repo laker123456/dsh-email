@@ -214,7 +214,7 @@ async function handleLogin(settingsScope: any, ctx: any, req: any, res: any): Pr
     return
   }
   if (!password) {
-    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '授权码不能为空' } })
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'AD密码不能为空' } })
     return
   }
   if (provider !== '' && !PROVIDER_NAMES.includes(provider as any)) {
@@ -246,6 +246,17 @@ async function handleLogin(settingsScope: any, ctx: any, req: any, res: any): Pr
   }
 }
 
+/** POST /api/logout: clear saved password so the login page reappears on next load. */
+async function handleLogout(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  try {
+    await mutateSettings(settingsScope, ctx, (current) => ({ ...current, password: '' }))
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '退出失败') } })
+  }
+}
+
 /** Read-modify-write the settings scope with optimistic concurrency. */
 async function mutateSettings(settingsScope: any, ctx: any, mutate: (current: EmailSettingsValue) => EmailSettingsValue): Promise<void> {
   if (ctx.settings.writable === false) throw new Error('settings provider is read-only')
@@ -264,7 +275,7 @@ function handleListLabels(settingsScope: any, res: any): void {
 }
 
 /** POST /api/labels → create or update a label by id. */
-async function handleSaveLabel(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+async function handleSaveLabel(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
   let body: any
   try { body = await readJsonBody(req) } catch (error) {
     responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
@@ -287,6 +298,7 @@ async function handleSaveLabel(settingsScope: any, ctx: any, req: any, res: any)
       else labels.push(label)
       return { ...current, labels }
     })
+    getPool().invalidateLabelCache()
     responseJson(res, 200, { ok: true })
   } catch (error) {
     const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
@@ -295,7 +307,7 @@ async function handleSaveLabel(settingsScope: any, ctx: any, req: any, res: any)
 }
 
 /** POST /api/labels/delete → remove a label by id. */
-async function handleDeleteLabel(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+async function handleDeleteLabel(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
   let body: any
   try { body = await readJsonBody(req) } catch (error) {
     responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
@@ -311,10 +323,187 @@ async function handleDeleteLabel(settingsScope: any, ctx: any, req: any, res: an
       const labels = (current.labels ?? []).filter(l => l.id !== id)
       return { ...current, labels }
     })
+    getPool().invalidateLabelCache()
     responseJson(res, 200, { ok: true })
   } catch (error) {
     const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
     responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '删除失败') } })
+  }
+}
+
+/** Common body parsing + validation for flag-toggling routes (toggle-seen, pin). */
+async function handleFlagToggle(getPool: () => EmailPool, req: any, res: any, op: 'seen' | 'pin'): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const uid = Number(body?.uid)
+  const account = typeof body?.account === 'string' && body.account !== '' ? body.account : undefined
+  const folder = typeof body?.folder === 'string' && body.folder !== '' ? body.folder : ''
+  const on = Boolean(body?.on)
+  if (!Number.isInteger(uid) || uid <= 0) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'uid 必须是正整数' } })
+    return
+  }
+  if (folder === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'folder 不能为空' } })
+    return
+  }
+  try {
+    if (op === 'seen') await getPool().toggleSeen(account, uid, folder, on)
+    else await getPool().flagPinned(account, uid, folder, on)
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const message = messageOf(error, op === 'seen' ? '切换已读失败' : '置顶失败')
+    responseJson(res, 500, { ok: false, error: { code: 'internal', message } })
+  }
+}
+
+async function handleToggleSeen(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+  await handleFlagToggle(getPool, req, res, 'seen')
+}
+
+async function handlePin(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+  await handleFlagToggle(getPool, req, res, 'pin')
+}
+
+/** POST /api/move → move a message to another folder (e.g. trash). */
+async function handleMove(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const uid = Number(body?.uid)
+  const account = typeof body?.account === 'string' && body.account !== '' ? body.account : undefined
+  const folder = typeof body?.folder === 'string' && body.folder !== '' ? body.folder : ''
+  const target = typeof body?.target === 'string' && body.target !== '' ? body.target : ''
+  if (!Number.isInteger(uid) || uid <= 0) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'uid 必须是正整数' } })
+    return
+  }
+  if (folder === '' || target === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'folder 和 target 不能为空' } })
+    return
+  }
+  try {
+    await getPool().moveMessage(account, uid, folder, target)
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const message = messageOf(error, '移动邮件失败')
+    responseJson(res, 500, { ok: false, error: { code: 'internal', message } })
+  }
+}
+
+function handleListTodos(settingsScope: any, res: any): void {
+  const value = settingsScope.get() as EmailSettingsValue
+  responseJson(res, 200, { ok: true, value: value.todos ?? [] })
+}
+
+/** POST /api/todos → add a message to the todo box. */
+async function handleSaveTodo(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const uid = Number(body?.uid)
+  const account = typeof body?.account === 'string' ? body.account.trim() : ''
+  const folder = typeof body?.folder === 'string' ? body.folder.trim() : ''
+  const subject = typeof body?.subject === 'string' ? body.subject : ''
+  const from = typeof body?.from === 'string' ? body.from : ''
+  const date = typeof body?.date === 'string' ? body.date : ''
+  const seen = !!body?.seen
+  if (!Number.isInteger(uid) || uid <= 0 || folder === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'uid 和 folder 不能为空' } })
+    return
+  }
+  const id = 'todo_' + uid + '_' + folder + '_' + Date.now()
+  try {
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const todos = (current.todos ?? []).slice()
+      if (!todos.some(t => t.uid === uid && t.folder === folder && t.account === account)) {
+        todos.push({ id, account, folder, uid, subject, from, date, seen, addedAt: Date.now() })
+      }
+      return { ...current, todos }
+    })
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '添加待办失败') } })
+  }
+}
+
+/** POST /api/todos/sync → pull \Flagged messages from the server and merge into todos. */
+async function handleSyncTodos(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any = {}
+  try { body = await readJsonBody(req) } catch { /* empty body is fine */ }
+  const account = typeof body?.account === 'string' ? body.account.trim() : ''
+  const limit = Number.isInteger(body?.limit) && body.limit > 0 ? body.limit : 200
+  try {
+    const pool = getPool()
+    const result = await pool.listFlagged(account || undefined, limit)
+    const flagged = result.messages
+    const accountName = result.account || account || 'default'
+    const fromStr = (m: { from?: any[] }): string => {
+      const a = Array.isArray(m.from) ? m.from[0] : m.from
+      if (!a) return ''
+      if (typeof a === 'string') return a
+      return a.name ? `${a.name} <${a.address || ''}>` : (a.address || '')
+    }
+    const before = ((settingsScope.get() as EmailSettingsValue)?.todos ?? []).length
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const existing = (current.todos ?? []).slice()
+      const key = (t: { account: string; folder: string; uid: number }) => t.account + '|' + t.folder + '|' + t.uid
+      const have = new Set(existing.map(key))
+      for (const m of flagged) {
+        const k = accountName + '|' + (m.folder || '') + '|' + m.uid
+        if (!have.has(k)) {
+          existing.push({
+            id: 'todo_' + m.uid + '_' + (m.folder || '') + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+            account: accountName,
+            folder: m.folder || '',
+            uid: m.uid,
+            subject: m.subject || '',
+            from: fromStr(m),
+            date: m.date || '',
+            seen: !!m.seen,
+            addedAt: Date.now(),
+          })
+          have.add(k)
+        }
+      }
+      return { ...current, todos: existing }
+    })
+    const after = ((settingsScope.get() as EmailSettingsValue)?.todos ?? []).length
+    responseJson(res, 200, { ok: true, value: { synced: Math.max(0, after - before), total: after } })
+  } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: messageOf(error, '同步待办失败') } })
+  }
+}
+
+/** POST /api/todos/delete → remove a todo entry by id. */
+async function handleDeleteTodo(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const id = typeof body?.id === 'string' ? body.id.trim() : ''
+  if (id === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'id 不能为空' } })
+    return
+  }
+  try {
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const todos = (current.todos ?? []).filter(t => t.id !== id)
+      return { ...current, todos }
+    })
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '删除待办失败') } })
   }
 }
 
@@ -332,8 +521,40 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
     await handleLogin(settingsScope, ctx, req, res)
     return
   }
+  if (req.method === 'POST' && sub === '/api/logout') {
+    await handleLogout(settingsScope, ctx, req, res)
+    return
+  }
   if (req.method === 'POST' && sub === '/api/mark-seen') {
     await handleMarkSeen(getPool, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/toggle-seen') {
+    await handleToggleSeen(getPool, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/move') {
+    await handleMove(getPool, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/pin') {
+    await handlePin(getPool, req, res)
+    return
+  }
+  if (req.method === 'GET' && sub === '/api/todos') {
+    handleListTodos(settingsScope, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/todos') {
+    await handleSaveTodo(getPool, settingsScope, ctx, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/todos/delete') {
+    await handleDeleteTodo(getPool, settingsScope, ctx, req, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/todos/sync') {
+    await handleSyncTodos(getPool, settingsScope, ctx, req, res)
     return
   }
   if (req.method === 'POST' && sub === '/api/send') {
@@ -349,11 +570,11 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
     return
   }
   if (req.method === 'POST' && sub === '/api/labels') {
-    await handleSaveLabel(settingsScope, ctx, req, res)
+    await handleSaveLabel(getPool, settingsScope, ctx, req, res)
     return
   }
   if (req.method === 'POST' && sub === '/api/labels/delete') {
-    await handleDeleteLabel(settingsScope, ctx, req, res)
+    await handleDeleteLabel(getPool, settingsScope, ctx, req, res)
     return
   }
 
@@ -372,6 +593,20 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
     if (sub === '/api/asset/emailAI.png') {
       try {
         const data = await readFile(join(ASSET_DIR, 'emailAI.png'))
+        res.setHeader('Content-Type', 'image/png')
+        res.setHeader('Content-Length', String(data.length))
+        res.setHeader('Cache-Control', 'no-store')
+        res.writeHead(200)
+        res.end(data)
+      } catch {
+        responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'asset missing' } })
+      }
+      return
+    }
+    if (sub === '/api/asset/emialLogo.png' || sub === '/api/asset/email-logo.png') {
+      try {
+        const file = sub === '/api/asset/email-logo.png' ? 'email-logo.png' : 'emialLogo.png'
+        const data = await readFile(join(ASSET_DIR, file))
         res.setHeader('Content-Type', 'image/png')
         res.setHeader('Content-Length', String(data.length))
         res.setHeader('Cache-Control', 'no-store')
@@ -431,6 +666,19 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
       }
       const offset = clampInt(Number(url.searchParams.get('offset') ?? 0), 0, 0, 100000)
       const value = await pool.list(account, folder, limit, offset, url.searchParams.get('unreadOnly') === '1')
+      responseJson(res, 200, { ok: true, value })
+      return
+    }
+    if (sub === '/api/search') {
+      const pool = getPool()
+      const q = (url.searchParams.get('q') ?? '').trim()
+      if (q === '') {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'q 不能为空' } })
+        return
+      }
+      const limit = clampInt(Number(url.searchParams.get('limit') ?? 50), 50, 1, 200)
+      const folderName = folder || pool.resolveName(account) && pool.account(pool.resolveName(account)).inboxFolder || 'INBOX'
+      const value = await pool.search(account, q, folderName, limit)
       responseJson(res, 200, { ok: true, value })
       return
     }
@@ -535,18 +783,29 @@ button, select, input { font: inherit; }
   width: 210px; background: #ebf0f5; border-right: 1px solid #dce2e9;
   display: flex; flex-direction: column; padding: 12px 8px; overflow-y: auto; flex-shrink: 0;
 }
+.sidebar-action-row {
+  display: flex; gap: 8px; margin-bottom: 12px;
+}
+.sidebar-action-row .btn-compose { flex: 1 1 0; margin-bottom: 0; }
+.btn-fetch {
+  flex: 1 1 0; background: #fff; color: #2b80ff; border: 1px solid #2b80ff;
+  border-radius: 6px; padding: 8px 12px; font-size: 13px; font-weight: 500;
+  display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer;
+  box-shadow: 0 2px 4px rgba(0,86,224,0.08);
+}
+.btn-fetch:hover { background: #f0f6ff; }
 .btn-compose {
   background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; border: none;
   border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 500;
-  display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; margin-bottom: 12px;
+  display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer;
   box-shadow: 0 2px 4px rgba(0,86,224,0.2);
 }
 .btn-compose:hover { filter: brightness(1.05); }
-.menu-group { margin-bottom: 16px; }
+.menu-group { margin-bottom: 8px; }
 .menu-title { font-size: 11px; color: #8a97a8; padding: 4px 12px; }
 .menu-item {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 7px 12px; border-radius: 6px; color: #333; cursor: pointer;
+  padding: 5px 12px; border-radius: 6px; color: #333; cursor: pointer;
   font-size: 13px; border: none; background: none; width: 100%; text-align: left;
 }
 .menu-item:hover { background: #dedede; }
@@ -556,6 +815,7 @@ button, select, input { font: inherit; }
 .menu-item.active .menu-item-left i { color: #0056e0; }
 .menu-item-left span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .count-badge { font-size: 11px; color: #0056e0; font-weight: bold; flex-shrink: 0; }
+.unread-dot { width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .sidebar-footer { margin-top: auto; padding: 8px 12px; font-size: 11px; color: #8a97a8; }
 
 /* 中间邮件列表 */
@@ -578,7 +838,9 @@ button, select, input { font: inherit; }
 #messages li:hover { background: #f6f8fa; }
 #messages li.active { background: #dce7f5; }
 #messages li.unread .subject { font-weight: 700; color: #0056e0; }
-#messages li.unread::before { content: ""; display: inline-block; width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; margin-right: 6px; vertical-align: 2px; }
+#messages li.unread .subject::before { content: ""; display: inline-block; width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+#messages li.flagged { background: #fff8e6; border-left: 3px solid #f0a020; padding-left: 9px; }
+#messages li.flagged .subject::after { content: "📌"; margin-left: 6px; font-size: 12px; }
 #messages li.hint { color: #8a97a8; cursor: default; text-align: center; }
 #messages .subject { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; }
 #messages .meta { color: #8a97a8; font-size: 11px; display: flex; gap: 8px; margin-top: 3px; }
@@ -621,10 +883,13 @@ button, select, input { font: inherit; }
 #attach a { color: #1262d6; text-decoration: none; margin-right: 14px; display: inline-flex; align-items: center; gap: 4px; }
 #attach a:hover { text-decoration: underline; }
 
-/* banner */
+/* banner：页面中央浮层提示 */
 #banner {
-  display: none; margin: 0; padding: 8px 16px; border: 1px solid #d4a72c;
-  background: #fff8c5; color: #7a5400; font-size: 12px; flex-shrink: 0;
+  display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 200; margin: 0; padding: 10px 18px; border: 1px solid #e1e6ed;
+  background: #fff; color: #333; font-size: 13px; border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12); max-width: 80vw; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
 /* 登录视图 */
@@ -794,41 +1059,55 @@ dialog#labelModal button {
 }
 dialog#labelModal button.btn-cancel { background: #f2f4f7; color: #555; }
 dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; border: none; }
+#ctxMenu .ctx-item { padding: 8px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px; color: #333; }
+#ctxMenu .ctx-item:hover { background: #f0f6ff; }
+#ctxMenu .ctx-item.ctx-danger { color: #d4351c; }
+#ctxMenu .ctx-item.ctx-danger:hover { background: #fde8e6; }
+#ctxMenu .ctx-item i { width: 14px; text-align: center; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="logo-area">
-    <div class="logo-title">
-      <i class="fa-solid fa-envelope" style="font-size:18px"></i>
-      <span>WeBank<span class="logo-sub">邮箱</span></span>
-    </div>
+    <img src="${INBOX_ROUTE}/api/asset/email-logo.png" alt="logo" style="height:44px;width:auto;object-fit:contain;">
   </div>
   <div class="search-bar">
     <i class="fa-solid fa-magnifying-glass"></i>
-    <input type="text" placeholder="搜索邮件（暂未启用）" disabled>
+    <input id="searchInput" type="text" placeholder="搜索邮件主题/发件人/收件人/正文" autocomplete="off">
   </div>
   <div class="user-area">
-    <i class="fa-solid fa-arrow-rotate-right" id="refresh" style="cursor:pointer; color:#555" title="刷新"></i>
     <button id="aiAssistantBtn" type="button" title="AI 助理" style="border:none;background:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:6px;font-size:13px;color:#333">
       <img src="${INBOX_ROUTE}/api/asset/emailAI.png" alt="AI助理" style="width:24px;height:24px;border-radius:50%">
       <span>AI助理</span>
+    </button>
+    <button id="logoutBtn" type="button" title="退出登录" style="border:1px solid #d0d7de;background:#fff;cursor:pointer;padding:4px 10px;font-size:12px;color:#555;border-radius:6px;display:flex;align-items:center;gap:4px;">
+      <i class="fa-solid fa-right-from-bracket"></i> 退出登录
     </button>
   </div>
 </div>
 
 <div id="banner"></div>
+<div id="fetchLoading" style="position:fixed; top:12px; left:50%; transform:translateX(-50%); background:#fff; border:1px solid #e1e6ed; border-radius:16px; padding:6px 14px; font-size:12px; color:#555; box-shadow:0 2px 8px rgba(0,0,0,0.08); display:none; z-index:50; gap:6px; align-items:center;">
+  <i class="fa-solid fa-circle-notch fa-spin"></i><span>加载中…</span>
+</div>
+<div id="ctxMenu" style="position:fixed; display:none; background:#fff; border:1px solid #e1e6ed; border-radius:6px; box-shadow:0 4px 12px rgba(0,0,0,0.12); padding:4px 0; min-width:140px; z-index:100; font-size:13px;">
+  <div class="ctx-item" data-act="reply"><i class="fa-solid fa-reply"></i> 回复邮件</div>
+  <div class="ctx-item" data-act="todo"><i class="fa-solid fa-list-check"></i> 设为待办</div>
+  <div class="ctx-item" data-act="seen"><i class="fa-solid fa-envelope-open"></i> <span class="ctx-seen-label">设为已读</span></div>
+  <div class="ctx-item" data-act="pin"><i class="fa-solid fa-thumbtack"></i> <span class="ctx-pin-label">置顶邮件</span></div>
+  <div class="ctx-item ctx-danger" data-act="delete"><i class="fa-solid fa-trash"></i> 删除邮件</div>
+</div>
 
 <div id="loginView">
   <form id="loginForm">
     <h2>登录 WeBank 邮箱</h2>
-    <div class="subtitle">请输入邮箱地址与授权码（非登录密码）</div>
+    <div class="subtitle">请输入邮箱地址与AD密码</div>
     <input type="hidden" id="loginProvider" value="webank">
     <label for="loginUser">邮箱地址</label>
     <input id="loginUser" type="email" autocomplete="username" placeholder="user@webank.com">
-    <label for="loginPass">授权码</label>
-    <input id="loginPass" type="password" autocomplete="current-password" placeholder="邮箱授权码">
+    <label for="loginPass">AD密码</label>
+    <input id="loginPass" type="password" autocomplete="current-password" placeholder="邮箱AD密码">
     <button id="loginBtn" type="submit">登录</button>
     <div id="loginMsg"></div>
   </form>
@@ -836,9 +1115,14 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 
 <div class="main-container" id="mainView">
   <div class="sidebar">
-    <button class="btn-compose" id="composeBtn" type="button" title="写信">
-      <i class="fa-solid fa-pen-to-square"></i> 写信
-    </button>
+    <div class="sidebar-action-row">
+      <button class="btn-fetch" id="fetchBtn" type="button" title="收信">
+        <i class="fa-solid fa-inbox"></i> 收信
+      </button>
+      <button class="btn-compose" id="composeBtn" type="button" title="写信">
+        <i class="fa-solid fa-pen-to-square"></i> 写信
+      </button>
+    </div>
     <div class="menu-group">
       <div class="menu-title">文件夹</div>
       <nav id="folders"></nav>
@@ -867,8 +1151,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   <div class="reader">
     <div class="reader-toolbar">
       <div class="left">
-        <button id="remoteBtn" type="button" style="display:none"><i class="fa-solid fa-image"></i> 加载远程图片</button>
-        <span>远程图片默认拦截 · 脚本一律禁用</span>
+        <span>邮件正文在沙箱内渲染，脚本一律禁用</span>
       </div>
       <div class="right" id="readerMeta"></div>
     </div>
@@ -883,9 +1166,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         <img src="${INBOX_ROUTE}/api/asset/emailAI.png" alt="AI" style="width:20px;height:20px;border-radius:50%">
         <span>AI 助理</span>
       </div>
-      <button id="aiPanelClose" type="button" class="ai-panel-close" title="收起">
-        <i class="fa-solid fa-chevron-right"></i>
-      </button>
     </div>
     <iframe id="aiFrame" src="${INBOX_ROUTE}/api/asset/assistant.html" title="AI 助理" referrerpolicy="no-referrer"></iframe>
   </aside>
@@ -1002,7 +1282,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: false };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true };
   var LABEL_COLORS = ['#0056e0', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
@@ -1079,7 +1359,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     var u = new URLSearchParams();
     Object.keys(params).forEach(function (k) {
       var v = params[k];
-      if (v !== '' && v !== null && v !== undefined && v !== false) u.set(k, v);
+      if (v === '' || v === null || v === undefined || v === false) return;
+      u.set(k, v === true ? '1' : String(v));
     });
     var s = u.toString();
     return s ? '?' + s : '';
@@ -1125,7 +1406,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       }
       var nav = document.getElementById('folders');
       nav.innerHTML = '';
-      folders.forEach(function (f) {
+      var trashIdx = -1;
+      folders.forEach(function (f, i) {
         var btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'menu-item';
@@ -1160,7 +1442,44 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
           loadList();
         };
         nav.appendChild(btn);
+        if (trashIdx < 0 && (f.specialUse === '\\\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
       });
+      var todoBtn = document.createElement('button');
+      todoBtn.type = 'button';
+      todoBtn.id = 'todoBtn';
+      todoBtn.className = 'menu-item';
+      var tLeft = document.createElement('div');
+      tLeft.className = 'menu-item-left';
+      var tIcon = document.createElement('i');
+      tIcon.className = 'fa-solid fa-list-check';
+      tIcon.style.cssText = 'width:16px;text-align:center;color:#666;';
+      var tLabel = document.createElement('span');
+      tLabel.textContent = '待办邮件';
+      tLeft.appendChild(tIcon);
+      tLeft.appendChild(tLabel);
+      todoBtn.appendChild(tLeft);
+      var tCount = document.createElement('span');
+      tCount.id = 'todoCount';
+      tCount.className = 'count-badge';
+      tCount.style.display = 'none';
+      todoBtn.appendChild(tCount);
+      if (state.view === 'todo') todoBtn.classList.add('active');
+      todoBtn.onclick = function () {
+        if (state.view === 'todo') return;
+        state.view = 'todo';
+        state.uid = null;
+        markActiveFolder();
+        markActiveLabel();
+        openTodoView();
+      };
+      var inserted = false;
+      if (trashIdx >= 0) {
+        var after = nav.children[trashIdx + 1];
+        if (after) nav.insertBefore(todoBtn, after);
+        else nav.appendChild(todoBtn);
+        inserted = true;
+      }
+      if (!inserted) nav.appendChild(todoBtn);
     });
   }
   function markActiveFolder() {
@@ -1168,12 +1487,120 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     for (var i = 0; i < btns.length; i++) {
       btns[i].classList.toggle('active', state.view === 'folder' && btns[i].dataset.path === state.folder);
     }
+    var todoBtn = document.getElementById('todoBtn');
+    if (todoBtn) todoBtn.classList.toggle('active', state.view === 'todo');
   }
   function markActiveLabel() {
     var btns = document.querySelectorAll('#labels .menu-item');
     for (var i = 0; i < btns.length; i++) {
       btns[i].classList.toggle('active', state.view === 'label' && btns[i].dataset.id === state.labelId);
     }
+    var todoBtn = document.getElementById('todoBtn');
+    if (todoBtn) todoBtn.classList.toggle('active', state.view === 'todo');
+  }
+
+  function loadTodoCount() {
+    return fetch(BASE + '/api/todos').then(function (res) {
+      return res.json().catch(function () { return null; });
+    }).then(function (d) {
+      var todos = (d && d.ok && Array.isArray(d.value)) ? d.value : [];
+      var badge = document.getElementById('todoCount');
+      if (todos.length > 0) {
+        badge.textContent = todos.length;
+        badge.style.display = '';
+      } else {
+        badge.style.display = 'none';
+      }
+      if (state.view === 'todo') loadTodoList(todos, state.unreadOnly);
+    }).catch(function () { /* best-effort */ });
+  }
+  function openTodoView() {
+    state.labelId = '';
+    state.offset = 0;
+    var listEl = document.getElementById('messages');
+    listEl.innerHTML = '';
+    var loading = document.createElement('li');
+    loading.className = 'hint';
+    loading.textContent = '正在从邮箱同步待办邮件…';
+    listEl.appendChild(loading);
+    var more = document.getElementById('more');
+    if (more) more.style.display = 'none';
+    fetch(BASE + '/api/todos/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: state.account || 'default', limit: 200 }),
+    }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function () {
+      loadTodoList(null, state.unreadOnly);
+      loadTodoCount();
+    }).catch(function () {
+      loadTodoList(null, state.unreadOnly);
+      loadTodoCount();
+    });
+  }
+  function loadTodoList(todos, onlyUnread) {
+    var listEl = document.getElementById('messages');
+    listEl.innerHTML = '';
+    if (!todos) {
+      fetch(BASE + '/api/todos').then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        loadTodoList((d && d.ok && Array.isArray(d.value)) ? d.value : [], onlyUnread);
+      });
+      return;
+    }
+    var filtered = onlyUnread ? todos.filter(function (t) { return !t.seen; }) : todos;
+    filtered.forEach(function (t) {
+      var li = document.createElement('li');
+      li.dataset.uid = String(t.uid);
+      li.dataset.folder = t.folder;
+      li.dataset.todoId = t.id;
+      li.dataset.subject = t.subject || '(无主题)';
+      li.dataset.from = t.from || '';
+      li.dataset.date = t.date || '';
+      var subject = document.createElement('span');
+      subject.className = 'subject';
+      subject.textContent = t.subject || '(无主题)';
+      li.appendChild(subject);
+      var meta = document.createElement('div');
+      meta.className = 'meta';
+      var from = document.createElement('span');
+      from.className = 'from';
+      from.textContent = t.from || '(未知)';
+      var date = document.createElement('span');
+      date.textContent = fmtDate(t.date);
+      meta.appendChild(from);
+      meta.appendChild(date);
+      li.appendChild(meta);
+      li.onclick = function () { openMessage(t.uid, t.folder); };
+      li.oncontextmenu = function (e) {
+        e.preventDefault();
+        var menu = document.getElementById('ctxMenu');
+        menu.querySelector('.ctx-seen-label').textContent = '移除待办';
+        menu.querySelector('.ctx-pin-label').textContent = '置顶邮件';
+        menu.dataset.uid = String(t.uid);
+        menu.dataset.folder = t.folder;
+        menu.dataset.todoId = t.id;
+        menu.dataset.subject = t.subject || '';
+        menu.dataset.from = t.from || '';
+        menu.dataset.date = t.date || '';
+        menu.dataset.seen = '1';
+        menu.dataset.flagged = '0';
+        menu.dataset.isTodo = '1';
+        menu.style.display = 'block';
+        var x = e.clientX, y = e.clientY;
+        var rect = menu.getBoundingClientRect();
+        if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 4;
+        if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 4;
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+      };
+      listEl.appendChild(li);
+    });
+    if (filtered.length === 0) {
+      var hint = document.createElement('li');
+      hint.className = 'hint';
+      hint.textContent = todos.length === 0 ? '待办箱为空' : '没有未读待办邮件';
+      listEl.appendChild(hint);
+    }
+    var more = document.getElementById('more');
+    if (more) more.style.display = 'none';
   }
 
   function loadLabels() {
@@ -1191,19 +1618,27 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         if (state.view === 'label' && state.labelId === l.id) btn.classList.add('active');
         var left = document.createElement('div');
         left.className = 'menu-item-left';
+        var icon = document.createElement('i');
+        icon.className = 'fa-regular fa-folder';
+        icon.style.cssText = 'width:16px;text-align:center;color:#666;';
+        var span = document.createElement('span');
+        span.textContent = l.name;
+        left.appendChild(icon);
+        left.appendChild(span);
+        btn.appendChild(left);
+        var right = document.createElement('div');
+        right.style.cssText = 'display:flex;align-items:center;gap:6px;';
         var dot = document.createElement('span');
         dot.className = 'label-dot';
         dot.style.background = l.color || LABEL_COLORS[0];
-        var span = document.createElement('span');
-        span.textContent = l.name;
-        left.appendChild(dot);
-        left.appendChild(span);
-        btn.appendChild(left);
+        right.appendChild(dot);
         var del = document.createElement('button');
         del.type = 'button';
         del.className = 'label-delete';
         del.title = '删除标签';
         del.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        right.appendChild(del);
+        btn.appendChild(right);
         del.onclick = function (ev) {
           ev.stopPropagation();
           if (!confirm('删除标签 "' + l.name + '"？')) return;
@@ -1225,7 +1660,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
             loadLabels();
           }).catch(function (err) { showBanner(err.message); });
         };
-        btn.appendChild(del);
         btn.onclick = function () {
           if (state.view === 'label' && state.labelId === l.id) return;
           state.view = 'label';
@@ -1284,8 +1718,18 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   function rowEl(m) {
     var li = document.createElement('li');
     li.dataset.uid = String(m.uid);
-    if (m.folder) li.dataset.folder = m.folder;
+    var effFolder = m.folder || state.folder;
+    li.dataset.folder = effFolder;
+    li.dataset.seen = m.seen ? '1' : '0';
+    li.dataset.flagged = m.flagged ? '1' : '0';
+    li.dataset.subject = m.subject || '(无主题)';
+    li.dataset.from = (m.from || []).map(function (a) {
+      var p = parseAddr(a);
+      return p.address || p.name;
+    }).filter(Boolean).join(',');
+    li.dataset.date = m.date || '';
     if (!m.seen) li.classList.add('unread');
+    if (m.flagged) li.classList.add('flagged');
     if (m.uid === state.uid) li.classList.add('active');
     var subject = document.createElement('span');
     subject.className = 'subject';
@@ -1310,9 +1754,157 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     meta.appendChild(from);
     meta.appendChild(date);
     li.appendChild(meta);
-    li.onclick = function () { openMessage(m.uid, m.folder); };
+    li.onclick = function () { openMessage(m.uid, effFolder); };
+    li.oncontextmenu = function (e) {
+      e.preventDefault();
+      openCtxMenu(e, li);
+    };
     return li;
   }
+
+  function openCtxMenu(e, li) {
+    var menu = document.getElementById('ctxMenu');
+    var seen = li.dataset.seen === '1';
+    var flagged = li.dataset.flagged === '1';
+    menu.querySelector('.ctx-seen-label').textContent = seen ? '设为未读' : '设为已读';
+    menu.querySelector('.ctx-pin-label').textContent = flagged ? '取消置顶' : '置顶邮件';
+    menu.dataset.uid = li.dataset.uid;
+    menu.dataset.folder = li.dataset.folder;
+    menu.dataset.seen = li.dataset.seen;
+    menu.dataset.flagged = li.dataset.flagged;
+    menu.dataset.subject = li.dataset.subject;
+    menu.dataset.from = li.dataset.from;
+    menu.dataset.date = li.dataset.date;
+    menu.style.display = 'block';
+    var x = e.clientX, y = e.clientY;
+    var rect = menu.getBoundingClientRect();
+    if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 4;
+    if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 4;
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+  }
+  function closeCtxMenu() {
+    var menu = document.getElementById('ctxMenu');
+    if (menu) menu.style.display = 'none';
+  }
+  document.addEventListener('click', function () { closeCtxMenu(); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeCtxMenu(); });
+
+  function ctxAction(act) {
+    var menu = document.getElementById('ctxMenu');
+    var uid = Number(menu.dataset.uid);
+    var folder = menu.dataset.folder;
+    var seen = menu.dataset.seen === '1';
+    var flagged = menu.dataset.flagged === '1';
+    var subject = menu.dataset.subject;
+    var from = menu.dataset.from;
+    var date = menu.dataset.date;
+    var isTodo = menu.dataset.isTodo === '1';
+    var todoId = menu.dataset.todoId;
+    closeCtxMenu();
+    if (act === 'reply') {
+      startReply({ to: from, subject: subject });
+      return;
+    }
+    if (isTodo && act === 'seen') {
+      fetch(BASE + '/api/todos/delete', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: todoId }),
+      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        if (d && d.ok) { showBanner('已移除待办'); loadTodoCount(); }
+        else showBanner((d && d.error && d.error.message) || '移除失败');
+      });
+      return;
+    }
+    if (act === 'todo') {
+      if (isTodo) {
+        fetch(BASE + '/api/todos/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: todoId }),
+        }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+          if (d && d.ok) { showBanner('已移除待办'); loadTodoCount(); }
+          else showBanner((d && d.error && d.error.message) || '移除失败');
+        });
+        if (!flagged) {
+          fetch(BASE + '/api/pin', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: false }),
+          });
+        }
+      } else {
+        fetch(BASE + '/api/todos', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account: state.account, folder: folder, uid: uid, subject: subject, from: from, date: date, seen: seen }),
+        }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+          if (d && d.ok) { showBanner('已加入待办'); loadTodoCount(); }
+          else showBanner((d && d.error && d.error.message) || '加入待办失败');
+        });
+        if (!flagged) {
+          fetch(BASE + '/api/pin', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: true }),
+          }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+            if (d && d.ok) {
+              var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
+              if (li) { li.classList.add('flagged'); li.dataset.flagged = '1'; }
+            }
+          });
+        }
+      }
+      return;
+    }
+    if (act === 'seen') {
+      fetch(BASE + '/api/toggle-seen', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: !seen }),
+      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        if (d && d.ok) {
+          var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
+          if (li) {
+            li.classList.toggle('unread', seen);
+            li.dataset.seen = seen ? '0' : '1';
+          }
+        } else showBanner((d && d.error && d.error.message) || '切换失败');
+      });
+      return;
+    }
+    if (act === 'pin') {
+      fetch(BASE + '/api/pin', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: !flagged }),
+      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        if (d && d.ok) {
+          showBanner(flagged ? '已取消置顶' : '已置顶');
+          if (state.view === 'folder') {
+            loadList();
+          } else if (state.view === 'todo') {
+            loadTodoList(null, state.unreadOnly);
+          }
+        } else showBanner((d && d.error && d.error.message) || '置顶失败');
+      });
+      return;
+    }
+    if (act === 'delete') {
+      if (!confirm('确定删除这封邮件？（移动到已删除文件夹）')) return;
+      fetch(BASE + '/api/move', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: state.account, folder: folder, uid: uid, target: '已删除' }),
+      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        if (d && d.ok) {
+          var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
+          if (li) li.remove();
+          showBanner('已删除');
+        } else showBanner((d && d.error && d.error.message) || '删除失败');
+      });
+      return;
+    }
+  }
+  document.querySelectorAll('#ctxMenu .ctx-item').forEach(function (item) {
+    item.onclick = function (e) {
+      e.stopPropagation();
+      ctxAction(item.dataset.act);
+    };
+  });
 
   function loadList() {
     var listEl = document.getElementById('messages');
@@ -1336,21 +1928,66 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       }
     }).catch(function (err) { showBanner(err.message); });
   }
+  function silentRefresh() {
+    if (state.offset !== 0) return Promise.resolve();
+    var params = state.view === 'label'
+      ? { account: state.account, label: state.labelId, limit: state.limit }
+      : { account: state.account, folder: state.folder, limit: state.limit, unreadOnly: state.unreadOnly };
+    return api('/api/messages', params).then(function (value) {
+      var listEl = document.getElementById('messages');
+      var existing = {};
+      for (var i = 0; i < listEl.children.length; i++) {
+        var li = listEl.children[i];
+        if (li.dataset.uid) existing[li.dataset.uid] = li;
+      }
+      var seen = {};
+      var fresh = value.messages || [];
+      var prependBucket = [];
+      fresh.forEach(function (m) {
+        var key = String(m.uid);
+        seen[key] = true;
+        var old = existing[key];
+        if (old) {
+          old.classList.toggle('unread', !m.seen);
+          old.classList.toggle('active', m.uid === state.uid);
+          existing[key] = null;
+        } else {
+          prependBucket.push(rowEl(m));
+        }
+      });
+      for (var k in existing) {
+        if (existing[k] && existing[k].parentNode) existing[k].parentNode.removeChild(existing[k]);
+      }
+      if (prependBucket.length) {
+        var hint = listEl.querySelector('.hint');
+        if (hint) hint.remove();
+        for (var j = prependBucket.length - 1; j >= 0; j--) {
+          listEl.insertBefore(prependBucket[j], listEl.firstChild);
+        }
+      }
+      var shown = listEl.children.length;
+      var more = document.getElementById('more');
+      more.style.display = (state.view === 'label' || shown >= value.count) ? 'none' : '';
+      if (shown === 0) {
+        var h = document.createElement('li');
+        h.className = 'hint';
+        h.textContent = value.count === 0 ? (state.view === 'label' ? '此标签没有匹配邮件' : '此文件夹没有邮件') : '没有更多邮件';
+        listEl.appendChild(h);
+      }
+    }).catch(function () { /* 静默刷新不弹错 */ });
+  }
 
   function loadFrame(folder) {
     var frame = document.getElementById('frame');
     frame.src = BASE + '/api/message.html' + qs({
       account: state.account, folder: folder, uid: state.uid, images: state.imagesAllowed,
     });
-    var btn = document.getElementById('remoteBtn');
-    btn.innerHTML = state.imagesAllowed ? '<i class="fa-solid fa-check"></i> 已允许远程图片' : '<i class="fa-solid fa-image"></i> 加载远程图片';
-    btn.disabled = state.imagesAllowed;
   }
 
   function openMessage(uid, folder) {
     var effFolder = folder || state.folder;
     state.uid = uid;
-    state.imagesAllowed = false;
+    state.imagesAllowed = true;
     var items = document.getElementById('messages').children;
     var flipped = false;
     for (var i = 0; i < items.length; i++) {
@@ -1401,7 +2038,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         attach.appendChild(link);
       });
       attach.style.display = (v.attachments && v.attachments.length > 0) ? '' : 'none';
-      document.getElementById('remoteBtn').style.display = '';
       loadFrame(effFolder);
     }).catch(function (err) {
       head.innerHTML = '<div id="placeholder">' + esc(err.message) + '</div>';
@@ -1412,27 +2048,102 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     if (state.view === 'label') { this.checked = false; return; }
     state.unreadOnly = this.checked;
     state.offset = 0;
+    if (state.view === 'todo') {
+      fetch(BASE + '/api/todos').then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        loadTodoList((d && d.ok && Array.isArray(d.value)) ? d.value : [], state.unreadOnly);
+      });
+      return;
+    }
     loadList();
   };
-  document.getElementById('refresh').onclick = function () {
-    state.offset = 0;
-    state.uid = null;
-    loadFolders().then(loadList);
-    loadLabels();
+  var logoutBtn = document.getElementById('logoutBtn');
+  if (logoutBtn) {
+    logoutBtn.onclick = function () {
+      if (!confirm('退出登录？将清空已保存的AD密码并回到登录页。')) return;
+      fetch(BASE + '/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+        .then(function (res) { return res.json().catch(function () { return null; }); })
+        .then(function (d) {
+          if (d && d.ok) {
+            document.getElementById('loginPass').value = '';
+            var u = document.getElementById('loginUser');
+            if (u && !u.value) u.value = '';
+            showLogin();
+          } else {
+            showBanner((d && d.error && d.error.message) || '退出失败');
+          }
+        }).catch(function () { showBanner('退出失败'); });
+    };
+  }
+  var searchInput = document.getElementById('searchInput');
+  var searchTimer = null;
+  if (searchInput) {
+    searchInput.onkeydown = function (e) {
+      if (e.key !== 'Enter') return;
+      var q = this.value.trim();
+      if (!q) {
+        if (state.view === 'search') {
+          state.view = 'folder';
+          state.offset = 0;
+          loadList();
+        }
+        return;
+      }
+      if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }
+      state.view = 'search';
+      state.searchQ = q;
+      state.offset = 0;
+      markActiveFolder();
+      markActiveLabel();
+      var listEl = document.getElementById('messages');
+      listEl.innerHTML = '';
+      var loading = document.createElement('li');
+      loading.className = 'hint';
+      loading.textContent = '搜索 "' + q + '" 中…';
+      listEl.appendChild(loading);
+      var more = document.getElementById('more');
+      if (more) more.style.display = 'none';
+      api('/api/search', { account: state.account, folder: state.folder, q: q, limit: 50 }).then(function (value) {
+        listEl.innerHTML = '';
+        var msgs = value.messages || [];
+        if (msgs.length === 0) {
+          var hint = document.createElement('li');
+          hint.className = 'hint';
+          hint.textContent = '没有匹配 "' + q + '" 的邮件';
+          listEl.appendChild(hint);
+          return;
+        }
+        msgs.forEach(function (m) { listEl.appendChild(rowEl(m)); });
+      }).catch(function (err) { showBanner(err.message); });
+    };
+  }
+  document.getElementById('fetchBtn').onclick = function () {
+    var btn = document.getElementById('fetchBtn');
+    var loading = document.getElementById('fetchLoading');
+    var orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-rotate fa-spin"></i> 收信';
+    loading.style.display = 'flex';
+    loadFolders().then(function () {
+      return loadList().then(silentRefresh);
+    }).then(function () {
+      /* 静默完成，不弹 banner */
+    }).catch(function (err) {
+      showBanner(err && err.message ? err.message : '收信失败');
+    }).finally(function () {
+      loading.style.display = 'none';
+      btn.disabled = false;
+      btn.innerHTML = orig;
+    });
   };
   setInterval(function () {
     var compose = document.getElementById('composeModal');
     if (compose && compose.open) return;
     if (document.getElementById('loginView') && document.getElementById('loginView').classList.contains('active')) return;
-    loadList();
+    silentRefresh();
   }, 60000);
   document.getElementById('more').onclick = function () {
     state.offset += state.limit;
     loadList();
-  };
-  document.getElementById('remoteBtn').onclick = function () {
-    state.imagesAllowed = true;
-    loadFrame(state.view === 'label' ? (document.querySelector('#messages li.active') ? document.querySelector('#messages li.active').dataset.folder : '') : state.folder);
   };
   document.getElementById('addLabelBtn').onclick = function () {
     openLabelModal(null);
@@ -1446,9 +2157,11 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   document.getElementById('aiAssistantBtn').onclick = function () {
     document.getElementById('aiPanel').style.display = '';
   };
-  document.getElementById('aiPanelClose').onclick = function () {
-    document.getElementById('aiPanel').style.display = 'none';
-  };
+  window.addEventListener('message', function (e) {
+    if (e.data && e.data.type === 'ai-close-panel') {
+      document.getElementById('aiPanel').style.display = 'none';
+    }
+  });
   var composeEditor = document.getElementById('composeEditor');
   function exec(cmd, val) {
     document.execCommand(cmd, false, val || null);
@@ -1625,6 +2338,17 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     document.getElementById('composeModal').showModal();
     document.getElementById('composeTo').focus();
   };
+  function startReply(orig) {
+    loadFromInfo();
+    document.getElementById('composeTo').value = orig.to || '';
+    document.getElementById('composeCc').value = '';
+    var subj = orig.subject || '';
+    document.getElementById('composeSubject').value = /^Re:/i.test(subj) ? subj : 'Re: ' + subj;
+    composeEditor.innerHTML = '';
+    document.getElementById('composeCcRow').style.display = 'none';
+    document.getElementById('composeModal').showModal();
+    composeEditor.focus();
+  }
   document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').close(); };
   document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').close(); };
   document.getElementById('composeSend').onclick = doSend;
@@ -1660,6 +2384,12 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     document.getElementById('loginView').classList.add('active');
     document.getElementById('mainView').style.display = 'none';
     document.getElementById('banner').style.display = 'none';
+    fetch(BASE + '/api/me').then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+      if (d && d.ok && d.value && d.value.user) {
+        var u = document.getElementById('loginUser');
+        if (u && !u.value) u.value = d.value.user;
+      }
+    });
   }
   function showMain() {
     document.getElementById('loginView').classList.remove('active');
@@ -1674,7 +2404,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     var msg = document.getElementById('loginMsg');
     var btn = document.getElementById('loginBtn');
     if (!user) { msg.textContent = '请填写邮箱地址'; return; }
-    if (!password) { msg.textContent = '请填写授权码'; return; }
+    if (!password) { msg.textContent = '请填写AD密码'; return; }
     msg.textContent = '';
     btn.disabled = true;
     btn.textContent = '登录中…';
@@ -1691,7 +2421,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     }).then(function () {
       btn.textContent = '已保存，加载中…';
       showMain();
-      loadFolders().then(loadList).then(loadLabels).catch(function (err) {
+      loadFolders().then(loadList).then(loadLabels).then(loadTodoCount).catch(function (err) {
         showBanner(err.message);
       });
     }).catch(function (err) {

@@ -12,6 +12,19 @@ export const EmailLabelSchema = z.object({
   color: z.string().default(''),
 })
 
+/** One todo entry pinning a message to the todo box. */
+export const EmailTodoSchema = z.object({
+  id: z.string().default(''),
+  account: z.string().default(''),
+  folder: z.string().default(''),
+  uid: z.number().default(0),
+  subject: z.string().default(''),
+  from: z.string().default(''),
+  date: z.string().default(''),
+  seen: z.boolean().default(false),
+  addedAt: z.number().default(0),
+})
+
 /**
  * The settings-page shape: the single default account plus shared policy.
  * Multi-account (`accounts` map) stays YAML-only; the page edits the
@@ -37,6 +50,7 @@ export const EmailSettingsSchema = z.object({
     secure: z.boolean().default(true),
   }),
   labels: z.array(EmailLabelSchema).default([]),
+  todos: z.array(EmailTodoSchema).default([]),
 })
 
 export interface EmailLabel {
@@ -44,6 +58,18 @@ export interface EmailLabel {
   name: string
   keywords: string[]
   color: string
+}
+
+export interface EmailTodo {
+  id: string
+  account: string
+  folder: string
+  uid: number
+  subject: string
+  from: string
+  date: string
+  seen: boolean
+  addedAt: number
 }
 
 export interface EmailSettingsValue {
@@ -58,6 +84,7 @@ export interface EmailSettingsValue {
   imap: { host: string; port: number; secure: boolean }
   smtp: { host: string; port: number; secure: boolean }
   labels: EmailLabel[]
+  todos: EmailTodo[]
 }
 
 /** Project the row config (cordis.patch.yml) into the settings-schema base shape. */

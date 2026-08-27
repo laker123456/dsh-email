@@ -17,6 +17,8 @@ import type {
   ListedMessage,
 } from './types.js'
 
+const LABEL_CACHE_TTL_MS = 5 * 60 * 1000
+
 export class MailError extends Error {
   constructor(message: string) {
     super(message)
@@ -128,6 +130,7 @@ export class EmailPool {
   private readonly imaps = new Map<string, ImapEntry>()
   private readonly smtps = new Map<string, Transporter>()
   private readonly queues = new Map<string, Promise<unknown>>()
+  private readonly labelCache = new Map<string, { value: EmailListResult; expireAt: number }>()
   private idleTimer: NodeJS.Timeout | undefined
 
   constructor(private readonly settings: ResolvedEmailSettings) {}
@@ -285,43 +288,121 @@ export class EmailPool {
       uids.reverse()
       const window = uids.slice(offset, offset + limit)
       const messages = await this.fetchListed(client, window)
+      // 单独 SEARCH FLAGGED 拿权威 flagged uid 集合：readOnly mailbox 上
+      // fetchAll 返回的 flags 可能是 session 缓存，pin/unpin 后不会立即刷新，
+      // 导致置顶排序失效。SEARCH 走服务器端索引，总是当前值。
+      let flaggedSet = new Set<number>()
+      try {
+        const found = await client.search({ flagged: true }, { uid: true })
+        const fids = found === false ? [] : (found as number[])
+        flaggedSet = new Set(fids)
+        for (const m of messages) m.flagged = flaggedSet.has(m.uid)
+      } catch { /* 退回 fetchListed 的 flags */ }
+      if (flaggedSet.size > 0) {
+        try {
+          messages.sort((a, b) => {
+            const af = flaggedSet.has(a.uid) ? 1 : 0
+            const bf = flaggedSet.has(b.uid) ? 1 : 0
+            if (af !== bf) return bf - af
+            const ta = Date.parse(a.date || '') || 0
+            const tb = Date.parse(b.date || '') || 0
+            return tb - ta
+          })
+        } catch { /* 排序失败不影响展示 */ }
+      }
       return { account: name, count: scopeCount, folder: folderName, messages }
     })
   }
 
   /**
-   * Cross-folder listing for the label view: fetch the most recent messages
-   * from every subscribed folder, keep those whose subject contains any of
-   * the given keywords (case-insensitive), merge by date desc, and cap at
-   * `limit`. Each returned message carries its source `folder` so the caller
-   * can open it later (uid is not unique across folders).
+   * Cross-folder listing for the label view. Results are cached per
+   * (account, sorted keywords, limit) for `LABEL_CACHE_TTL_MS` so repeat
+   * clicks on the same label return instantly; the first hit still pays the
+   * full parallel-scan cost. Cache entries are invalidated whenever labels
+   * are created/updated/deleted via `invalidateLabelCache()`.
    */
   async listByLabel(accountName: string | undefined, keywords: string[], limit: number): Promise<EmailListResult> {
     const name = this.resolveName(accountName)
-    const folderRows = await this.folders(name, true)
+    const cfg = this.account(name)
     const lowered = keywords.map(k => k.toLowerCase().trim()).filter(k => k !== '')
-    const collected: ListedMessage[] = []
-    for (const row of folderRows.folders) {
+    const cacheKey = name + '|' + lowered.join(',') + '|' + limit
+    const now = Date.now()
+    const cached = this.labelCache.get(cacheKey)
+    if (cached && cached.expireAt > now) return cached.value
+
+    const folderRows = await this.folders(name, true)
+    const perFolder = Math.min(limit * 3, 100)
+    const results = await Promise.all(folderRows.folders.map(async (row) => {
       try {
-        const result = await this.list(name, row.path, limit, 0, false)
-        for (const m of result.messages) {
-          if (lowered.length === 0) continue
-          const subj = String(m.subject || '').toLowerCase()
-          if (lowered.some(k => subj.includes(k))) {
-            collected.push({ ...m, folder: row.path })
+        const client = this.createImap(cfg)
+        await client.connect()
+        try {
+          await client.mailboxOpen(row.path, { readOnly: true })
+          const total = client.mailbox === false ? 0 : client.mailbox.exists
+          if (total === 0) return [] as ListedMessage[]
+          const start = Math.max(1, total - perFolder + 1)
+          const fetched = await client.fetchAll(start + ':*', { uid: true, envelope: true, flags: true, size: true, bodyStructure: true })
+          const out: ListedMessage[] = []
+          for (const m of fetched) {
+            if (lowered.length === 0) continue
+            const env = m.envelope as any
+            const subj = String(env?.subject || '').toLowerCase()
+            if (lowered.some(k => subj.includes(k))) {
+              const msg = listedFrom(m, m.size, structureHasAttachment(m.bodyStructure))
+              out.push({ ...msg, folder: row.path })
+            }
           }
+          return out
+        } finally {
+          await client.logout().catch(() => { /* best-effort */ })
         }
       } catch {
-        // A single folder failing (permissions, missing) must not abort the rest.
+        return [] as ListedMessage[]
       }
-    }
+    }))
+    const collected = results.flat()
     collected.sort((a, b) => {
       const ta = Date.parse(a.date || '') || 0
       const tb = Date.parse(b.date || '') || 0
       return tb - ta
     })
     const messages = collected.slice(0, limit)
-    return { account: name, count: collected.length, folder: '', messages }
+    const value: EmailListResult = { account: name, count: collected.length, folder: '', messages }
+    this.labelCache.set(cacheKey, { value, expireAt: now + LABEL_CACHE_TTL_MS })
+    return value
+  }
+
+  invalidateLabelCache(): void {
+    this.labelCache.clear()
+  }
+
+  /**
+   * 只查 INBOX 的 `\Flagged` 邮件。webank/Coremail 待办邮件 = 服务器端
+   * `\Flagged`，收件箱里的就是全部待办（已发送/草稿/垃圾里不会有待办）。
+   * 单文件夹 + 复用池连接，速度与收件箱列表相当。
+   */
+  async listFlagged(accountName: string | undefined, limit: number): Promise<EmailListResult> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = cfg.inboxFolder || 'INBOX'
+    return this.withImap(name, folderName, async (client) => {
+      const found = await client.search({ flagged: true }, { uid: true })
+      const uids = found === false ? [] : (found as number[])
+      if (uids.length === 0) return { account: name, count: 0, folder: folderName, messages: [] }
+      const sliced = uids.slice(-limit)
+      const fetched = await client.fetchAll(sliced, { uid: true, envelope: true, flags: true, size: true, bodyStructure: true }, { uid: true })
+      const out: ListedMessage[] = []
+      for (const m of fetched) {
+        const msg = listedFrom(m, m.size, structureHasAttachment(m.bodyStructure))
+        out.push({ ...msg, folder: folderName })
+      }
+      out.sort((a, b) => {
+        const ta = Date.parse(a.date || '') || 0
+        const tb = Date.parse(b.date || '') || 0
+        return tb - ta
+      })
+      return { account: name, count: uids.length, folder: folderName, messages: out }
+    })
   }
 
   async search(accountName: string | undefined, query: string, folder: string, limit: number): Promise<EmailSearchResult> {
@@ -449,6 +530,73 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
+    this.invalidateMailbox(name, folderName)
+  }
+
+  /** Toggle \\Seen flag on/off via a read-write connection. */
+  async toggleSeen(accountName: string | undefined, uid: number, folder: string, seen: boolean): Promise<void> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    const client = this.createImap(cfg)
+    try {
+      await client.connect()
+      await client.mailboxOpen(folderName, { readOnly: false })
+      if (seen) await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true })
+      else await client.messageFlagsRemove(uid, ['\\Seen'], { uid: true })
+    } catch (error) {
+      throw this.normalizeImapError(error, folderName)
+    } finally {
+      try { await client.logout() } catch { /* ignore */ }
+    }
+    this.invalidateMailbox(name, folderName)
+  }
+
+  /** Move a message to another folder (used for delete-to-trash). */
+  async moveMessage(accountName: string | undefined, uid: number, folder: string, targetFolder: string): Promise<void> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    const client = this.createImap(cfg)
+    try {
+      await client.connect()
+      await client.mailboxOpen(folderName, { readOnly: false })
+      await client.messageMove(uid, targetFolder, { uid: true })
+    } catch (error) {
+      throw this.normalizeImapError(error, folderName)
+    } finally {
+      try { await client.logout() } catch { /* ignore */ }
+    }
+  }
+
+  /** Toggle \\Flagged (pinned/starred) via a read-write connection. */
+  async flagPinned(accountName: string | undefined, uid: number, folder: string, pinned: boolean): Promise<void> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    const client = this.createImap(cfg)
+    try {
+      await client.connect()
+      await client.mailboxOpen(folderName, { readOnly: false })
+      if (pinned) await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true })
+      else await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true })
+    } catch (error) {
+      throw this.normalizeImapError(error, folderName)
+    } finally {
+      try { await client.logout() } catch { /* ignore */ }
+    }
+    this.invalidateMailbox(name, folderName)
+  }
+
+  /**
+   * Drop the pooled connection's cached mailbox selection so the next list/
+   * search re-opens it (readOnly) and picks up flag changes written by a
+   * separate read-write connection. Without this, Coremail/IMAP servers may
+   * keep serving stale flags from the readOnly mailbox snapshot.
+   */
+  invalidateMailbox(name: string, folder: string): void {
+    const entry = this.imaps.get(name)
+    if (entry && entry.selected === folder) entry.selected = null
   }
 
   async folders(accountName: string | undefined, subscribedOnly: boolean): Promise<EmailFoldersResult> {
