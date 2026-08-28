@@ -58,11 +58,11 @@ function contentDisposition(filename: string): string {
 
 /** Message body document served straight into the sandboxed reader iframe. */
 function messageHtmlDocument(html: string, text: string): string {
-  const docStart = '<!DOCTYPE html><html><head><meta charset="utf-8"><base target="_blank"></head><body>'
+  const docStart = '<!DOCTYPE html><html><head><meta charset="utf-8"><base target="_blank"><style>html,body{margin:0;padding:0;}body{padding:12px;font:14px/1.7 -apple-system,\'Segoe UI\',\'PingFang SC\',\'Microsoft YaHei\',sans-serif;color:#333;}img{max-width:100%;height:auto;}table{max-width:100%;}</style></head><body>'
   if (html !== '') return docStart + html + '</body></html>'
   const limited = truncateText(text, TEXT_FALLBACK_CHARS).text
   return docStart
-    + '<pre style="white-space:pre-wrap;word-wrap:break-word;font:14px/1.7 -apple-system,\'Segoe UI\',\'PingFang SC\',\'Microsoft YaHei\',sans-serif;margin:0;padding:12px;">'
+    + '<pre style="white-space:pre-wrap;word-wrap:break-word;margin:0;">'
     + escapeHtmlText(limited)
     + '</pre></body></html>'
 }
@@ -396,6 +396,49 @@ async function handleMove(getPool: () => EmailPool, req: any, res: any): Promise
   }
 }
 
+/** GET /api/dir-search?q=... → proxy time.weoa.com queryUserOrGroups with X-API-Key + OPERATOR from Weban auth.json. */
+async function handleDirSearch(req: any, res: any): Promise<void> {
+  const url = new URL(req.url ?? '/', 'http://localhost')
+  const q = (url.searchParams.get('q') ?? '').trim()
+  if (q === '') { responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'q 不能为空' } }); return }
+  const home = process.env.HOME ?? ''
+  const candidates = [
+    process.env.WEBAN_TIME_AUTH_FILE ?? '',
+    home + '/Library/Application Support/Weban Desktop/config/auth.json',
+    home + '/.config/Weban Desktop/config/auth.json',
+    home + '/.time/config.json',
+  ].filter(Boolean)
+  let auth: { key?: string; username?: string; 'API-KEY'?: string; OPERATOR?: string } | null = null
+  for (const p of candidates) {
+    try {
+      const raw = await readFile(p, 'utf8')
+      const j = JSON.parse(raw)
+      const key = j.key ?? j['API-KEY']
+      const username = j.username ?? j.OPERATOR
+      if (key && username) { auth = { key, username }; break }
+    } catch { /* try next */ }
+  }
+  if (!auth) {
+    responseJson(res, 500, { ok: false, error: { code: 'no-auth', message: '未找到 WeBank TIME 鉴权（请在 We伴 桌面端宠物日程弹窗授权，或写 ~/.time/config.json）' } })
+    return
+  }
+  try {
+    const r = await fetch('https://time.weoa.com/s_itms/time/api/item/queryUserOrGroups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': auth.key!, 'OPERATOR': auth.username! },
+      body: JSON.stringify({ queryKey: q }),
+    })
+    const j = await r.json() as any
+    if (j?.CODE !== '0') {
+      responseJson(res, 502, { ok: false, error: { code: 'upstream', message: j?.MSG || ('TIME 接口返回 CODE=' + j?.CODE) } })
+      return
+    }
+    responseJson(res, 200, { ok: true, value: { users: Array.isArray(j.data?.users) ? j.data.users : [], groups: Array.isArray(j.data?.groups) ? j.data.groups : [] } })
+  } catch (error) {
+    responseJson(res, 502, { ok: false, error: { code: 'fetch-failed', message: messageOf(error, 'TIME 接口请求失败') } })
+  }
+}
+
 function handleListTodos(settingsScope: any, res: any): void {
   const value = settingsScope.get() as EmailSettingsValue
   responseJson(res, 200, { ok: true, value: value.todos ?? [] })
@@ -577,6 +620,10 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
     await handleDeleteLabel(getPool, settingsScope, ctx, req, res)
     return
   }
+  if (req.method === 'GET' && sub === '/api/dir-search') {
+    await handleDirSearch(req, res)
+    return
+  }
 
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET')
@@ -692,10 +739,11 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
       const uid = requireUid(url)
       const source = await getPool().readSource(account, uid, folder)
       const view = await parseHtmlMessage(source, MAX_INLINE_IMAGE_BYTES)
-      // CSP sandbox is the real security boundary: no scripts, no forms, no
-      // network fetches; img-src data: blocks tracking pixels until the user
-      // explicitly opts in with images=1.
-      const csp = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+      // CSP is the real security boundary: script-src 'none' blocks all inline
+      // scripts; img-src data: blocks tracking pixels until the user explicitly
+      // opts in with images=1. No sandbox directive so the iframe stays
+      // same-origin and the parent can measure its content height.
+      const csp = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:"
         + (url.searchParams.get('images') === '1' ? ' http: https:' : '')
         + "; frame-ancestors 'self'"
       responseHtml(res, 200, messageHtmlDocument(view.html, view.text), { 'Content-Security-Policy': csp })
@@ -848,7 +896,8 @@ button, select, input { font: inherit; }
 #more:hover { background: #e6e9f0; }
 
 /* 右侧阅读区 */
-.reader { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #fff; }
+.reader { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: #fff; overflow: hidden; }
+#readerScroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 .reader-toolbar {
   height: 42px; padding: 0 16px; border-bottom: 1px solid #e8ecef; display: flex;
   align-items: center; justify-content: space-between; flex-shrink: 0; background: #fff;
@@ -876,7 +925,7 @@ button, select, input { font: inherit; }
 #readerHead .recipient-line { color: #888; }
 #readerHead .kv { color: #888; }
 #placeholder { color: #8a97a8; padding: 40px; text-align: center; }
-#frame { flex: 1; border: none; width: 100%; background: #fff; min-height: 0; }
+#frame { border: none; width: 100%; background: #fff; min-height: 200px; flex-shrink: 0; }
 #attach { padding: 10px 24px; background: #fff; border-top: 1px solid #f0f0f0; font-size: 12px; flex-shrink: 0; }
 #attach a { color: #1262d6; text-decoration: none; margin-right: 14px; display: inline-flex; align-items: center; gap: 4px; }
 #attach a:hover { text-decoration: underline; }
@@ -993,6 +1042,35 @@ dialog#composeModal .form-input {
   flex: 1; border: none; outline: none; font-size: 13px; padding: 2px 0; background: transparent;
 }
 dialog#composeModal .placeholder-tip { color: #aaa; font-size: 11px; margin-left: 8px; }
+dialog#composeModal .recipient-container {
+  flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+  padding: 2px 0;
+}
+dialog#composeModal .recipient-input { flex: 1; min-width: 80px; border: none; outline: none; font-size: 13px; padding: 2px 0; background: transparent; }
+dialog#composeModal .recipient-tag {
+  display: inline-flex; align-items: center; background: #f0f4ff;
+  border: 1px solid #c5d8f5; border-radius: 12px; padding: 2px 4px 2px 8px;
+  font-size: 12px; color: #1a4b8c; gap: 4px;
+}
+dialog#composeModal .recipient-tag.invalid {
+  background: #fff0f0; border-color: #f5c2c2; color: #cf222e;
+}
+dialog#composeModal .recipient-tag .close-btn { cursor: pointer; color: #7a9bc7; font-weight: bold; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+dialog#composeModal .recipient-tag .close-btn:hover { color: #fff; background: #5a7fb5; }
+dialog#composeModal .recipient-tag.invalid .close-btn { color: #cf222e; }
+dialog#composeModal .recipient-tag.invalid .close-btn:hover { color: #fff; background: #cf222e; }
+#acBox {
+  position: fixed; z-index: 9999;
+  background: #fff; border: 1px solid #d0d7de; border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.12); min-width: 240px; max-width: 360px;
+  max-height: 240px; overflow-y: auto; font-size: 12px; display: none;
+}
+#acBox .ac-item { padding: 6px 10px; cursor: pointer; border-bottom: 1px solid #f0f0f0; }
+#acBox .ac-item:last-child { border-bottom: none; }
+#acBox .ac-item:hover, #acBox .ac-item.active { background: #e6f0ff; }
+#acBox .ac-item .ac-name { color: #333; }
+#acBox .ac-item .ac-mail { color: #888; margin-left: 6px; font-size: 11px; }
+#acBox .ac-hint { padding: 6px 10px; color: #aaa; font-size: 11px; }
 dialog#composeModal .sub-tools {
   display: flex; align-items: center; gap: 14px; padding: 8px 0; color: #666; font-size: 12px;
 }
@@ -1001,11 +1079,12 @@ dialog#composeModal .editor-container {
   border: 1px solid #e8e8e8; border-radius: 4px; margin-top: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);
 }
 dialog#composeModal .editor-toolbar {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
-  padding: 6px 10px; background: #fcfcfc; border-bottom: 1px solid #e8e8e8; font-size: 13px;
+  display: flex; align-items: center; gap: 4px;
+  padding: 6px 8px; background: #fafafa; border-bottom: 1px solid #e8e8e8; font-size: 13px;
+  border-radius: 6px 6px 0 0; overflow-x: auto;
 }
 dialog#composeModal .tb-item {
-  cursor: pointer; padding: 3px 5px; border-radius: 2px; display: inline-flex;
+  cursor: pointer; padding: 3px 5px; border-radius: 3px; display: inline-flex;
   align-items: center; gap: 2px; color: #555; user-select: none;
 }
 dialog#composeModal .tb-item:hover { background: #ececec; }
@@ -1015,18 +1094,50 @@ dialog#composeModal .tb-select {
 }
 dialog#composeModal .tool-btn {
   display: inline-flex; align-items: center; justify-content: center;
-  height: 26px; min-width: 26px; padding: 0 5px; border-radius: 2px;
-  cursor: pointer; color: #555; font-size: 13px; user-select: none;
+  height: 28px; min-width: 28px; padding: 0 6px; border-radius: 4px;
+  cursor: pointer; color: #444; font-size: 14px; user-select: none;
+  border: 1px solid transparent; transition: background .12s, border-color .12s;
 }
-dialog#composeModal .tool-btn:hover { background: #ececec; }
-dialog#composeModal .tool-btn.active { background: #dcdcdc; }
+dialog#composeModal .tool-btn:hover { background: #eef1f5; border-color: #dde2e8; }
+dialog#composeModal .tool-btn.active { background: #dce7f5; color: #0056e0; border-color: #b8d4f5; }
+dialog#composeModal .tool-btn .fa-solid { font-size: 13px; }
 dialog#composeModal .tool-select {
-  height: 24px; border: 1px solid #d0d0d0; background: #fff;
-  border-radius: 2px; padding: 0 4px; font-size: 12px; color: #333; outline: none; cursor: pointer;
+  height: 26px; border: 1px solid #d0d0d0; background: #fff;
+  border-radius: 4px; padding: 0 6px; font-size: 12px; color: #333; outline: none; cursor: pointer;
 }
-dialog#composeModal .tb-divider { width: 1px; height: 14px; background: #e8e8e8; }
+dialog#composeModal .tool-select:hover { border-color: #b8c2cc; }
+dialog#composeModal .tb-divider { width: 1px; height: 18px; background: #e2e6eb; margin: 0 2px; }
+dialog#composeModal .color-pick {
+  display: inline-flex; align-items: center; gap: 2px; height: 28px; padding: 0 4px;
+  border-radius: 4px; border: 1px solid transparent; cursor: pointer; color: #444; user-select: none;
+  position: relative;
+}
+dialog#composeModal .color-pick:hover { background: #eef1f5; border-color: #dde2e8; }
+dialog#composeModal .color-pick-icon { display: inline-flex; flex-direction: column; align-items: center; line-height: 1; font-size: 13px; }
+dialog#composeModal .color-pick-bar { width: 14px; height: 3px; margin-top: 2px; background: #333; }
+dialog#composeModal .color-pick-arrow { font-size: 10px; color: #999; margin-left: 1px; }
+dialog#composeModal .color-palette {
+  position: absolute; display: none; z-index: 50; top: 64px; left: 8px;
+  background: #fff; border: 1px solid #d0d4d9; border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.15);
+  padding: 8px; font-size: 12px;
+}
+dialog#composeModal .palette-grid {
+  display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; max-width: 220px;
+}
+dialog#composeModal .palette-grid .swatch-cell {
+  width: 18px; height: 18px; border-radius: 3px; border: 1px solid #d0d0d0; cursor: pointer;
+  transition: transform .1s;
+}
+dialog#composeModal .palette-row .swatch-cell:hover { transform: scale(1.15); border-color: #3b7bff; }
+dialog#composeModal .palette-custom { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid #eee; }
+dialog#composeModal .palette-custom input[type=color] { width: 24px; height: 24px; padding: 0; border: 1px solid #d0d0d0; border-radius: 3px; cursor: pointer; background: #fff; }
 dialog#composeModal .editor-content {
-  height: 280px; padding: 12px 15px; outline: none; overflow-y: auto; font-size: 13px; line-height: 1.6;
+  height: 320px; padding: 16px 20px; outline: none; overflow-y: auto;
+  font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #222; background: #fff;
+}
+dialog#composeModal .editor-content:empty::before {
+  content: attr(data-placeholder); color: #b0b6bf; pointer-events: none;
 }
 dialog#composeModal .compose-footer {
   display: flex; align-items: center; gap: 12px; margin-top: 10px; color: #666; font-size: 12px;
@@ -1148,13 +1259,18 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   <div class="reader">
     <div class="reader-toolbar">
       <div class="left">
-        <span>邮件正文在沙箱内渲染，脚本一律禁用</span>
+        <span></span>
       </div>
       <div class="right" id="readerMeta"></div>
     </div>
-    <div id="readerHead"><div id="placeholder"><i class="fa-regular fa-envelope-open" style="font-size:32px; color:#d0d7de"></i><div style="margin-top:8px">在左侧选择一封邮件阅读</div></div></div>
-    <iframe id="frame" sandbox="" referrerpolicy="no-referrer" title="邮件正文"></iframe>
-    <div id="attach" style="display:none"></div>
+    <div id="readerScroll" style="position:relative">
+      <div id="readerLoading" style="position:absolute; inset:0; background:#fff; display:none; align-items:center; justify-content:center; z-index:5;">
+        <i class="fa-solid fa-circle-notch fa-spin" style="font-size:24px; color:#3b7bff;"></i>
+      </div>
+      <div id="readerHead"><div id="placeholder"><i class="fa-regular fa-envelope-open" style="font-size:32px; color:#d0d7de"></i><div style="margin-top:8px">在左侧选择一封邮件阅读</div></div></div>
+      <iframe id="frame" referrerpolicy="no-referrer" title="邮件正文"></iframe>
+      <div id="attach" style="display:none"></div>
+    </div>
   </div>
 
   <aside id="aiPanel" class="ai-panel" style="display:none">
@@ -1188,6 +1304,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 </dialog>
 
 <dialog id="composeModal">
+<div id="acBox"></div>
   <form id="composeForm" method="dialog">
     <div class="compose-topbar">
       <div class="actions">
@@ -1203,12 +1320,15 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     <div class="compose-body">
       <div class="form-row">
         <span class="form-label">收件人：</span>
-        <input id="composeTo" type="text" class="form-input" placeholder="发给多人时地址请以分号或逗号隔开">
-        <span class="placeholder-tip">发给多人时地址请以分号或逗号隔开</span>
+        <div class="recipient-container" id="composeToContainer">
+          <input id="composeTo" type="text" class="form-input recipient-input">
+        </div>
       </div>
       <div class="form-row" id="composeCcRow" style="display:none">
         <span class="form-label">抄 送：</span>
-        <input id="composeCc" type="text" class="form-input" placeholder="抄送地址">
+        <div class="recipient-container" id="composeCcContainer">
+          <input id="composeCc" type="text" class="form-input recipient-input">
+        </div>
       </div>
       <div class="form-row">
         <span class="form-label">主 题：</span>
@@ -1218,30 +1338,48 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         <span class="tb-item" id="composeAttachBtn" style="cursor:pointer;color:#3b7bff">📎 添加附件</span>
         <input type="file" id="composeAttachInput" multiple style="display:none">
         <span class="divider"></span>
-        <input id="composeAttachments" type="text" class="form-input" placeholder="附件路径，多个用逗号分隔" style="flex:1" readonly>
+        <input id="composeAttachments" type="text" class="form-input" style="flex:1" readonly>
       </div>
-      <div class="editor-container">
+      <div class="editor-container" style="position:relative">
         <div class="editor-toolbar">
-          <span class="tool-btn" data-cmd="undo" title="撤销">↶</span>
-          <span class="tool-btn" data-cmd="redo" title="重做">↷</span>
-          <span class="tool-btn" data-cmd="removeFormat" title="清除格式">🧹</span>
+          <span class="tool-btn" data-cmd="undo" title="撤销"><i class="fa-solid fa-rotate-left"></i></span>
+          <span class="tool-btn" data-cmd="redo" title="重做"><i class="fa-solid fa-rotate-right"></i></span>
+          <span class="tool-btn" data-cmd="removeFormat" title="清除格式"><i class="fa-solid fa-eraser"></i></span>
           <span class="tb-divider"></span>
           <select class="tool-select" id="composeFontName" title="字体">
             <option value="">默认字体</option>
-            <option value="Arial">Arial</option>
-            <option value="PingFang SC">PingFang SC</option>
-            <option value="Microsoft YaHei">Microsoft YaHei</option>
-            <option value="SimSun">SimSun</option>
-            <option value="Helvetica">Helvetica</option>
-            <option value="Georgia">Georgia</option>
+            <option value="SimSun, serif">宋体</option>
+            <option value="Microsoft YaHei, sans-serif">微软雅黑</option>
+            <option value="SimHei, sans-serif">黑体</option>
+            <option value="KaiTi, serif">楷体</option>
+            <option value="FangSong, serif">仿宋</option>
+            <option value="PingFang SC, sans-serif">苹方</option>
+            <option value="Hiragino Sans GB, sans-serif">冬青黑体</option>
+            <option value="STXihei, sans-serif">华文细黑</option>
+            <option value="STKaiti, serif">华文楷体</option>
+            <option value="STFangsong, serif">华文仿宋</option>
+            <option value="STSong, serif">华文宋体</option>
+            <option value="Arial, sans-serif">Arial</option>
+            <option value="Helvetica, sans-serif">Helvetica</option>
+            <option value="Georgia, serif">Georgia</option>
+            <option value="Times New Roman, serif">Times New Roman</option>
+            <option value="Courier New, monospace">Courier New</option>
+            <option value="Verdana, sans-serif">Verdana</option>
+            <option value="Tahoma, sans-serif">Tahoma</option>
           </select>
           <select class="tool-select" id="composeFontSize" title="字号">
             <option value="">字号</option>
-            <option value="2">小</option>
-            <option value="3">正常</option>
-            <option value="4">中</option>
-            <option value="5">大</option>
-            <option value="6">特大</option>
+            <option value="12px">12px</option>
+            <option value="13px">13px</option>
+            <option value="14px">小四</option>
+            <option value="15px">15px</option>
+            <option value="16px">四号</option>
+            <option value="18px">小三</option>
+            <option value="20px">20px</option>
+            <option value="22px">三号</option>
+            <option value="24px">小二</option>
+            <option value="28px">28px</option>
+            <option value="32px">二号</option>
           </select>
           <span class="tb-divider"></span>
           <span class="tool-btn" data-cmd="bold" title="加粗" style="font-weight:bold">B</span>
@@ -1249,19 +1387,30 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
           <span class="tool-btn" data-cmd="underline" title="下划线" style="text-decoration:underline">U</span>
           <span class="tool-btn" data-cmd="strikeThrough" title="删除线" style="text-decoration:line-through">S</span>
           <span class="tb-divider"></span>
-          <input type="color" class="tool-select" id="composeForeColor" title="文字颜色" style="width:24px;height:24px;padding:0;cursor:pointer;border:1px solid #d0d0d0;border-radius:2px">
+          <span class="color-pick" id="composeColorPick" title="文字颜色">
+            <span class="color-pick-icon"><i class="fa-solid fa-font"></i><span class="color-pick-bar" id="foreColorBar"></span></span>
+            <span class="color-pick-arrow"><i class="fa-solid fa-caret-down"></i></span>
+          </span>
+          <div class="color-palette" id="composeColorPalette">
+            <div class="palette-grid" data-colors="#000000,#1a1a1a,#333333,#4d4d4d,#666666,#808080,#999999,#b3b3b3,#cccccc,#e6e6e6,#f2f2f2,#ffffff"></div>
+            <div class="palette-grid" data-colors="#e0392b,#cf222e,#a31515,#e77d18,#d97706,#b45309,#d4a72c,#ca8a04,#a16207,#3b7bff,#1d4ed8,#1e40af"></div>
+            <div class="palette-grid" data-colors="#1a7f37,#15803d,#166534,#9333ea,#7e22ce,#6b21a8,#0891b2,#0e7490,#155e75,#db2777,#be185d,#9d174d"></div>
+            <div class="palette-grid" data-colors="#0d9488,#14b8a6,#5eead4,#84cc16,#65a30d,#4d7c0f,#f59e0b,#f97316,#ea580c,#ec4899,#d946ef,#a855f7"></div>
+            <div class="palette-grid" data-colors="#6366f1,#4f46e5,#4338ca,#8b5cf6,#7c3aed,#6d28d9,#3b82f6,#2563eb,#1d4ed8,#06b6d4,#0891b2,#0e7490"></div>
+            <div class="palette-custom"><input type="color" id="composeForeColor" value="#333333"><span>自定义</span></div>
+          </div>
           <span class="tb-divider"></span>
-          <span class="tool-btn" data-cmd="justifyLeft" title="左对齐">⬅</span>
-          <span class="tool-btn" data-cmd="justifyCenter" title="居中">↔</span>
-          <span class="tool-btn" data-cmd="justifyRight" title="右对齐">➡</span>
+          <span class="tool-btn" data-cmd="justifyLeft" title="左对齐"><i class="fa-solid fa-align-left"></i></span>
+          <span class="tool-btn" data-cmd="justifyCenter" title="居中"><i class="fa-solid fa-align-center"></i></span>
+          <span class="tool-btn" data-cmd="justifyRight" title="右对齐"><i class="fa-solid fa-align-right"></i></span>
           <span class="tb-divider"></span>
-          <span class="tool-btn" data-cmd="insertUnorderedList" title="无序列表">•</span>
-          <span class="tool-btn" data-cmd="insertOrderedList" title="有序列表">1.</span>
+          <span class="tool-btn" data-cmd="insertUnorderedList" title="无序列表"><i class="fa-solid fa-list-ul"></i></span>
+          <span class="tool-btn" data-cmd="insertOrderedList" title="有序列表"><i class="fa-solid fa-list-ol"></i></span>
           <span class="tb-divider"></span>
-          <span class="tool-btn" data-cmd="outdent" title="减少缩进">⇤</span>
-          <span class="tool-btn" data-cmd="indent" title="增加缩进">⇥</span>
+          <span class="tool-btn" data-cmd="outdent" title="减少缩进"><i class="fa-solid fa-outdent"></i></span>
+          <span class="tool-btn" data-cmd="indent" title="增加缩进"><i class="fa-solid fa-indent"></i></span>
         </div>
-        <div id="composeEditor" class="editor-content" contenteditable="true"></div>
+        <div id="composeEditor" class="editor-content" contenteditable="true" data-placeholder="在这里撰写正文…"></div>
       </div>
       <div class="compose-footer">
         <div class="from-info">发件人：<strong id="composeFrom">加载中…</strong></div>
@@ -1279,7 +1428,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0 };
   var LABEL_COLORS = ['#0056e0', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
@@ -1956,10 +2105,35 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     }).catch(function () { /* 静默刷新不弹错 */ });
   }
 
-  function loadFrame(folder) {
+  function loadFrame(folder, uid, token) {
     var frame = document.getElementById('frame');
+    frame.style.height = '600px';
+    try {
+      frame.contentWindow.document.open();
+      frame.contentWindow.document.write('<div></div>');
+      frame.contentWindow.document.close();
+    } catch (e) { /* cross-origin or not ready */ }
+    var pollTimer = null;
+    frame.onload = function () {
+      if (token !== state.openToken) return;
+      var loading = document.getElementById('readerLoading');
+      if (loading) loading.style.display = 'none';
+      var attempts = 0;
+      var trySize = function () {
+        if (token !== state.openToken) return;
+        attempts++;
+        try {
+          var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+          if (!doc || !doc.body) { if (attempts < 20) pollTimer = setTimeout(trySize, 150); return; }
+          var h = Math.max(doc.body.scrollHeight, doc.documentElement ? doc.documentElement.scrollHeight : 0);
+          if (h > 0) { frame.style.height = (h + 16) + 'px'; }
+          if (attempts < 20) pollTimer = setTimeout(trySize, 300);
+        } catch (e) { /* ignore */ }
+      };
+      trySize();
+    };
     frame.src = BASE + '/api/message.html' + qs({
-      account: state.account, folder: folder, uid: state.uid, images: state.imagesAllowed,
+      account: state.account, folder: folder, uid: uid, images: state.imagesAllowed,
     });
   }
 
@@ -1967,6 +2141,10 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     var effFolder = folder || state.folder;
     state.uid = uid;
     state.imagesAllowed = true;
+    var token = ++state.openToken;
+    var frame = document.getElementById('frame');
+    frame.removeAttribute('src');
+    frame.onload = null;
     var items = document.getElementById('messages').children;
     var flipped = false;
     for (var i = 0; i < items.length; i++) {
@@ -1986,8 +2164,12 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       }).catch(function () { /* best-effort; UI already updated */ });
     }
     var head = document.getElementById('readerHead');
-    head.innerHTML = '<div id="placeholder">加载中…</div>';
+    head.innerHTML = '';
+    var loading = document.getElementById('readerLoading');
+    loading.style.display = 'flex';
+    loadFrame(effFolder, uid, token);
     api('/api/message', { account: state.account, folder: effFolder, uid: uid }).then(function (v) {
+      if (token !== state.openToken) return;
       var fromParsed = parseAddr((v.from || [])[0]);
       var fromName = fromParsed.name || fromParsed.address || '(未知)';
       var to = (v.to || []).map(function (a) {
@@ -2017,8 +2199,10 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         attach.appendChild(link);
       });
       attach.style.display = (v.attachments && v.attachments.length > 0) ? '' : 'none';
-      loadFrame(effFolder);
+      loading.style.display = 'none';
     }).catch(function (err) {
+      if (token !== state.openToken) return;
+      loading.style.display = 'none';
       head.innerHTML = '<div id="placeholder">' + esc(err.message) + '</div>';
     });
   }
@@ -2142,9 +2326,29 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     }
   });
   var composeEditor = document.getElementById('composeEditor');
+  var savedRange = null;
+  function saveSel() {
+    var sel = window.getSelection();
+    if (sel && sel.rangeCount && composeEditor.contains(sel.anchorNode)) {
+      savedRange = sel.getRangeAt(0).cloneRange();
+    }
+  }
+  function restoreSel() {
+    if (savedRange) {
+      composeEditor.focus();
+      var sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(savedRange);
+      return true;
+    }
+    composeEditor.focus();
+    return false;
+  }
+  composeEditor.addEventListener('blur', saveSel);
   function exec(cmd, val) {
+    restoreSel();
     document.execCommand(cmd, false, val || null);
     composeEditor.focus();
+    saveSel();
     updateTbActive();
   }
   function updateTbActive() {
@@ -2161,9 +2365,77 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   document.querySelectorAll('#composeModal .tool-btn[data-cmd]').forEach(function (el) {
     el.onclick = function () { exec(el.dataset.cmd); };
   });
-  document.getElementById('composeFontName').onchange = function () { exec('fontName', this.value); this.value = ''; };
-  document.getElementById('composeFontSize').onchange = function () { exec('fontSize', this.value); this.value = ''; };
-  document.getElementById('composeForeColor').onchange = function () { exec('foreColor', this.value); };
+  document.getElementById('composeFontName').onchange = function () { exec('fontName', this.value); };
+  document.getElementById('composeFontSize').onchange = function () {
+    var px = this.value;
+    if (!px) return;
+    restoreSel();
+    var sel = window.getSelection();
+    if (!sel || !sel.rangeCount) { composeEditor.focus(); return; }
+    var range = sel.getRangeAt(0);
+    if (range.collapsed) {
+      var span = document.createElement('span');
+      span.style.fontSize = px;
+      span.appendChild(document.createTextNode('\u200b'));
+      range.insertNode(span);
+      range.setStart(span.firstChild, 1);
+      range.setEnd(span.firstChild, 1);
+      sel.removeAllRanges(); sel.addRange(range);
+    } else {
+      document.execCommand('styleWithCSS', false, true);
+      document.execCommand('fontSize', false, '7');
+      document.execCommand('styleWithCSS', false, false);
+      var fonts = composeEditor.querySelectorAll('font[size="7"]');
+      for (var i = 0; i < fonts.length; i++) {
+        fonts[i].removeAttribute('size');
+        fonts[i].style.fontSize = px;
+        if (fonts[i].tagName === 'FONT') {
+          var span2 = document.createElement('span');
+          span2.style.fontSize = px;
+          while (fonts[i].firstChild) span2.appendChild(fonts[i].firstChild);
+          fonts[i].parentNode.replaceChild(span2, fonts[i]);
+        }
+      }
+    }
+    composeEditor.focus();
+    saveSel();
+    updateTbActive();
+  };
+  var foreInput = document.getElementById('composeForeColor');
+  var foreBar = document.getElementById('foreColorBar');
+  var colorPick = document.getElementById('composeColorPick');
+  var colorPalette = document.getElementById('composeColorPalette');
+  function applyForeColor(color) {
+    restoreSel();
+    document.execCommand('styleWithCSS', false, true);
+    document.execCommand('foreColor', false, color);
+    document.execCommand('styleWithCSS', false, false);
+    foreBar.style.background = color;
+    composeEditor.focus(); saveSel(); updateTbActive();
+  }
+  var rows = colorPalette.querySelectorAll('.palette-grid');
+  for (var r = 0; r < rows.length; r++) {
+    var colors = rows[r].dataset.colors.split(',');
+    for (var c = 0; c < colors.length; c++) {
+      var cell = document.createElement('span');
+      cell.className = 'swatch-cell';
+      cell.style.background = colors[c];
+      cell.dataset.color = colors[c];
+      cell.title = colors[c];
+      cell.onclick = (function (col) { return function () { applyForeColor(col); colorPalette.style.display = 'none'; }; })(colors[c]);
+      rows[r].appendChild(cell);
+    }
+  }
+  foreInput.onchange = function () { applyForeColor(this.value); colorPalette.style.display = 'none'; };
+  colorPick.onclick = function (e) {
+    if (e.target.tagName === 'INPUT') return;
+    colorPalette.style.display = colorPalette.style.display === 'flex' ? 'none' : 'flex';
+  };
+  document.addEventListener('mousedown', function (e) {
+    if (colorPalette.style.display === 'flex' && !colorPalette.contains(e.target) && !colorPick.contains(e.target)) {
+      colorPalette.style.display = 'none';
+    }
+  });
   composeEditor.onkeyup = updateTbActive;
   composeEditor.onmouseup = updateTbActive;
 
@@ -2172,9 +2444,181 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     row.style.display = row.style.display === 'none' ? '' : 'none';
   };
 
+  var AC_RELAY = BASE + '/api/dir-search';
+  var acBox = document.getElementById('acBox');
+  var acTimer = null;
+  var acItems = [];
+  var acIdx = -1;
+  var acTarget = null;
+  function acRender(items, target) {
+    acTarget = target;
+    acItems = items;
+    acIdx = -1;
+    if (!items.length) {
+      acBox.innerHTML = '<div class="ac-hint">未匹配到同事</div>';
+      acBox.style.display = 'block';
+      var r0 = target.getBoundingClientRect();
+      acBox.style.left = r0.left + 'px';
+      acBox.style.top = (r0.bottom + 2) + 'px';
+      return;
+    }
+    acBox.innerHTML = items.map(function (u, i) {
+      return '<div class="ac-item" data-i="' + i + '"><span class="ac-name">' + esc(u.name) + '</span><span class="ac-mail">' + esc(u.mail) + '</span></div>';
+    }).join('');
+    var r = target.getBoundingClientRect();
+    acBox.style.left = r.left + 'px';
+    acBox.style.top = (r.bottom + 2) + 'px';
+    acBox.style.display = 'block';
+  }
+  function acClose() {
+    acBox.style.display = 'none';
+    acItems = [];
+    acIdx = -1;
+    acTarget = null;
+  }
+  function acActive(n) {
+    var els = acBox.querySelectorAll('.ac-item');
+    els.forEach(function (el, i) { el.classList.toggle('active', i === n); });
+    if (n >= 0 && els[n]) els[n].scrollIntoView({ block: 'nearest' });
+  }
+  function acPick(i) {
+    if (i < 0 || i >= acItems.length || !acTarget) return;
+    var pick = acItems[i];
+    var container = acTarget.closest('.recipient-container');
+    if (container) {
+      addRecipientTag(container, pick.mail, pick.name);
+      acTarget.value = '';
+    } else {
+      acTarget.value = pick.mail + '; ';
+    }
+    acClose();
+    acTarget.focus();
+  }
+  function addRecipientTag(container, mail, name, invalid) {
+    mail = String(mail || '').trim();
+    if (!mail) return;
+    var existing = container.querySelectorAll('.recipient-tag');
+    for (var i = 0; i < existing.length; i++) {
+      if (existing[i].dataset.mail === mail) return;
+    }
+    var tag = document.createElement('span');
+    tag.className = 'recipient-tag' + (invalid ? ' invalid' : '');
+    tag.dataset.mail = mail;
+    var label = name && name !== mail ? name + ' <' + mail + '>' : mail;
+    tag.innerHTML = '<span class="tag-label">' + esc(label) + '</span><span class="close-btn" title="移除">×</span>';
+    tag.querySelector('.close-btn').onclick = function () { tag.remove(); };
+    container.insertBefore(tag, container.querySelector('.recipient-input'));
+  }
+  function getRecipients(container) {
+    var mails = [];
+    container.querySelectorAll('.recipient-tag').forEach(function (tag) {
+      if (tag.dataset.mail) mails.push(tag.dataset.mail);
+    });
+    var input = container.querySelector('.recipient-input');
+    if (input) {
+      var residual = String(input.value || '').trim();
+      if (residual) {
+        residual.split(/[;,\\s]+/).filter(Boolean).forEach(function (m) { mails.push(m); });
+      }
+    }
+    return mails;
+  }
+  function setRecipients(container, str) {
+    container.querySelectorAll('.recipient-tag').forEach(function (t) { t.remove(); });
+    var input = container.querySelector('.recipient-input');
+    if (!input) return;
+    var s = String(str || '').trim();
+    if (!s) { input.value = ''; return; }
+    s.split(/[;,\\s]+/).filter(Boolean).forEach(function (m) { addRecipientTag(container, m, m); });
+    input.value = '';
+  }
+  function acFetch(q, target) {
+    if (!q || q.length < 1) { acClose(); return; }
+    fetch(AC_RELAY + '?q=' + encodeURIComponent(q), {
+      method: 'GET',
+    }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+      if (!d || !d.ok || !Array.isArray(d.value?.users)) { acClose(); return; }
+      var items = d.value.users.slice(0, 10).map(function (raw) {
+        var m = /^([^(]+)\\(([^)]+)\\)$/.exec(raw) || /^([^@\\s]+)$/.exec(raw);
+        if (!m) return null;
+        var id = m[1].trim();
+        var name = m[2] ? m[2].trim() : id;
+        return { id: id, name: name, mail: id + '@webank.com' };
+      }).filter(Boolean);
+      if (!items.length) { acClose(); return; }
+      acRender(items, target);
+    }).catch(function () { acClose(); });
+  }
+  var EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;
+  function bindAc(input) {
+    input.addEventListener('input', function () {
+      if (acTimer) clearTimeout(acTimer);
+      acTimer = setTimeout(function () {
+        var val = input.value;
+        var tail = val.split(/[;,]/).pop().trim();
+        acFetch(tail, input);
+      }, 200);
+    });
+    input.addEventListener('paste', function (e) {
+      var cd = e.clipboardData || (e.originalEvent && e.originalEvent.clipboardData);
+      var text = cd ? cd.getData('text') : '';
+      if (!text) return;
+      var parts = text.split(/[;,\\s\\n\\r]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+      var mailParts = parts.filter(function (s) { return EMAIL_RE.test(s); });
+      if (mailParts.length === 0) return;
+      e.preventDefault();
+      var container = input.closest('.recipient-container');
+      if (!container) return;
+      mailParts.forEach(function (m) { addRecipientTag(container, m, m); });
+      input.value = '';
+    });
+    input.addEventListener('keydown', function (e) {
+      if (acBox.style.display === 'block') {
+        if (e.key === 'ArrowDown') { e.preventDefault(); acIdx = Math.min(acIdx + 1, acItems.length - 1); acActive(acIdx); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); acIdx = Math.max(acIdx - 1, 0); acActive(acIdx); return; }
+        if (e.key === 'Enter' || e.key === 'Tab') {
+          if (acIdx >= 0) { e.preventDefault(); acPick(acIdx); return; }
+          if (acItems.length === 1) { e.preventDefault(); acPick(0); return; }
+        }
+        if (e.key === 'Escape') { acClose(); return; }
+      } else if (e.key === 'Enter' || e.key === ';' || e.key === ',') {
+        e.preventDefault();
+      }
+      if (e.key === 'Backspace' && input.value === '') {
+        var container = input.closest('.recipient-container');
+        var tags = container ? container.querySelectorAll('.recipient-tag') : null;
+        if (tags && tags.length) { tags[tags.length - 1].remove(); }
+      }
+    });
+    input.addEventListener('blur', function () {
+      setTimeout(function () {
+        acClose();
+        var val = input.value.trim();
+        if (!val) return;
+        if (EMAIL_RE.test(val)) {
+          var container = input.closest('.recipient-container');
+          if (container) { addRecipientTag(container, val, val); input.value = ''; }
+          return;
+        }
+        var container = input.closest('.recipient-container');
+        if (container) {
+          addRecipientTag(container, val, val, true);
+          input.value = '';
+        }
+      }, 200);
+    });
+  }
+  acBox.addEventListener('click', function (e) {
+    var el = e.target.closest('.ac-item');
+    if (el && acTarget) acPick(Number(el.dataset.i));
+  });
+  bindAc(document.getElementById('composeTo'));
+  bindAc(document.getElementById('composeCc'));
+  document.getElementById('composeModal').addEventListener('close', acClose);
+
   function openPreview() {
-    var to = document.getElementById('composeTo').value.trim();
-    var cc = document.getElementById('composeCc').value.trim();
+    var to = getRecipients(document.getElementById('composeToContainer')).join('; ');
+    var cc = getRecipients(document.getElementById('composeCcContainer')).join('; ');
     var subject = document.getElementById('composeSubject').value.trim();
     var html = composeEditor.innerHTML;
     var text = composeEditor.innerText.trim();
@@ -2197,8 +2641,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 
   function saveDraft() {
     var draft = {
-      to: document.getElementById('composeTo').value,
-      cc: document.getElementById('composeCc').value,
+      to: getRecipients(document.getElementById('composeToContainer')).join('; '),
+      cc: getRecipients(document.getElementById('composeCcContainer')).join('; '),
       subject: document.getElementById('composeSubject').value,
       html: composeEditor.innerHTML,
       attachments: document.getElementById('composeAttachments').value,
@@ -2216,8 +2660,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       var raw = localStorage.getItem('dsh-email-draft');
       if (!raw) return;
       var d = JSON.parse(raw);
-      document.getElementById('composeTo').value = d.to || '';
-      document.getElementById('composeCc').value = d.cc || '';
+      setRecipients(document.getElementById('composeToContainer'), d.to || '');
+      setRecipients(document.getElementById('composeCcContainer'), d.cc || '');
       document.getElementById('composeSubject').value = d.subject || '';
       composeEditor.innerHTML = d.html || '';
       document.getElementById('composeAttachments').value = d.attachments || '';
@@ -2268,8 +2712,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   }
 
   function doSend() {
-    var to = document.getElementById('composeTo').value.trim();
-    var cc = document.getElementById('composeCc').value.trim();
+    var to = getRecipients(document.getElementById('composeToContainer')).join('; ');
+    var cc = getRecipients(document.getElementById('composeCcContainer')).join('; ');
     var subject = document.getElementById('composeSubject').value.trim();
     var html = composeEditor.innerHTML.trim();
     var text = composeEditor.innerText.trim();
@@ -2303,8 +2747,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     });
   }
   function resetCompose() {
-    document.getElementById('composeTo').value = '';
-    document.getElementById('composeCc').value = '';
+    setRecipients(document.getElementById('composeToContainer'), '');
+    setRecipients(document.getElementById('composeCcContainer'), '');
     document.getElementById('composeSubject').value = '';
     document.getElementById('composeAttachments').value = '';
     composeEditor.innerHTML = '';
@@ -2319,8 +2763,8 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   };
   function startReply(orig) {
     loadFromInfo();
-    document.getElementById('composeTo').value = orig.to || '';
-    document.getElementById('composeCc').value = '';
+    setRecipients(document.getElementById('composeToContainer'), orig.to || '');
+    setRecipients(document.getElementById('composeCcContainer'), '');
     var subj = orig.subject || '';
     document.getElementById('composeSubject').value = /^Re:/i.test(subj) ? subj : 'Re: ' + subj;
     composeEditor.innerHTML = '';

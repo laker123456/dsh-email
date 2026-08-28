@@ -131,6 +131,7 @@ export class EmailPool {
   private readonly smtps = new Map<string, Transporter>()
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly labelCache = new Map<string, { value: EmailListResult; expireAt: number }>()
+  private readonly sourceCache = new Map<string, { source: Buffer; expireAt: number }>()
   private idleTimer: NodeJS.Timeout | undefined
 
   constructor(private readonly settings: ResolvedEmailSettings) {}
@@ -462,15 +463,41 @@ export class EmailPool {
         .sort((a, b) => b.uid - a.uid)
   }
 
+  private sourceCacheKey(name: string, uid: number, folder: string): string {
+    return name + '|' + folder + '|' + uid
+  }
+
+  private getSourceFromCache(key: string): Buffer | null {
+    const hit = this.sourceCache.get(key)
+    if (hit && hit.expireAt > Date.now()) return hit.source
+    if (hit) this.sourceCache.delete(key)
+    return null
+  }
+
+  private setSourceCache(key: string, source: Buffer): void {
+    this.sourceCache.set(key, { source, expireAt: Date.now() + 30000 })
+    if (this.sourceCache.size > 50) {
+      const firstKey = this.sourceCache.keys().next().value
+      if (firstKey) this.sourceCache.delete(firstKey)
+    }
+  }
+
   async read(accountName: string | undefined, uid: number, folder: string): Promise<EmailReadResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
+    const key = this.sourceCacheKey(name, uid, folderName)
+    const cached = this.getSourceFromCache(key)
+    if (cached) {
+      const body = await parseRawMessage(cached, this.settings.maxBodyChars)
+      return { account: name, uid, folder: folderName, ...body }
+    }
     return this.withImap(name, folderName, async (client) => {
       const message = await client.fetchOne(uid, { uid: true, source: true }, { uid: true })
       if (message === false || message.source === undefined) {
         throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
       }
+      this.setSourceCache(key, message.source)
       const body = await parseRawMessage(message.source, this.settings.maxBodyChars)
       return { account: name, uid, folder: folderName, ...body }
     })
@@ -481,11 +508,15 @@ export class EmailPool {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
+    const key = this.sourceCacheKey(name, uid, folderName)
+    const cached = this.getSourceFromCache(key)
+    if (cached) return cached
     return this.withImap(name, folderName, async (client) => {
       const message = await client.fetchOne(uid, { uid: true, source: true }, { uid: true })
       if (message === false || message.source === undefined) {
         throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
       }
+      this.setSourceCache(key, message.source)
       return message.source
     })
   }
