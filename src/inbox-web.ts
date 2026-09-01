@@ -110,7 +110,7 @@ async function handleMarkSeen(getPool: () => EmailPool, req: any, res: any): Pro
 /** POST /api/send: send a message straight from the inbox page (no agent approval). */
 async function handleSend(getPool: () => EmailPool, req: any, res: any): Promise<void> {
   let body: any
-  try { body = await readJsonBody(req, 256 * 1024) } catch (error) {
+  try { body = await readJsonBody(req, 25 * 1024 * 1024) } catch (error) {
     responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
     return
   }
@@ -285,6 +285,14 @@ async function handleSaveLabel(getPool: () => EmailPool, settingsScope: any, ctx
   const name = typeof body?.name === 'string' ? body.name.trim() : ''
   const color = typeof body?.color === 'string' ? body.color.trim() : ''
   const keywords = Array.isArray(body?.keywords) ? body.keywords.map((k: any) => String(k).trim()).filter((k: string) => k !== '') : []
+  const conditions = Array.isArray(body?.conditions)
+    ? body.conditions
+        .map((c: any) => ({
+          logic: c?.logic === 'AND' ? 'AND' : 'OR',
+          keyword: String(c?.keyword ?? '').trim(),
+        }))
+        .filter((c: { keyword: string }) => c.keyword !== '')
+    : []
   if (id === '' || name === '') {
     responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'id 和 name 不能为空' } })
     return
@@ -293,7 +301,7 @@ async function handleSaveLabel(getPool: () => EmailPool, settingsScope: any, ctx
     await mutateSettings(settingsScope, ctx, (current) => {
       const labels = (current.labels ?? []).slice()
       const idx = labels.findIndex(l => l.id === id)
-      const label = { id, name, keywords, color }
+      const label = { id, name, keywords, conditions, color }
       if (idx >= 0) labels[idx] = label
       else labels.push(label)
       return { ...current, labels }
@@ -707,7 +715,8 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
           responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '标签不存在：' + labelId } })
           return
         }
-        const value = await pool.listByLabel(account, label.keywords, limit)
+        const labelOffset = clampInt(Number(url.searchParams.get('offset') ?? 0), 0, 0, 100000)
+        const value = await pool.listByLabel(account, label.keywords, limit, labelOffset, label.conditions || [])
         responseJson(res, 200, { ok: true, value })
         return
       }
@@ -1009,18 +1018,28 @@ button, select, input { font: inherit; }
 }
 .menu-item:hover .label-delete { opacity: 1; }
 .menu-item .label-delete:hover { color: #cf222e; }
+.menu-item .label-edit {
+  border: none; background: none; color: #aaa; cursor: pointer;
+  padding: 2px 4px; font-size: 12px; opacity: 0; transition: opacity .15s;
+}
+.menu-item:hover .label-edit { opacity: 1; }
+.menu-item .label-edit:hover { color: #3b7bff; }
 
 dialog#labelModal {
   border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
-  width: 360px; box-shadow: 0 4px 20px rgba(0,0,0,0.12); color: #333;
+  width: 420px; max-width: 95vw; max-height: 90vh; overflow: auto;
+  margin: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.12); color: #333;
 }
 dialog#composeModal {
   border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
-  width: 820px; max-width: 95vw; max-height: 92vh; overflow: auto;
-  margin: auto; box-shadow: 0 4px 24px rgba(0,0,0,0.16); color: #333;
+  width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh;
+  border-radius: 0; overflow: hidden;
+  margin: 0; box-shadow: 0 4px 24px rgba(0,0,0,0.16); color: #333;
+  display: none;
 }
+dialog#composeModal[open] { display: flex; flex-direction: column; }
+dialog#composeModal .compose-body { padding: 12px 20px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
 dialog#composeModal::backdrop { background: rgba(0,0,0,0.35); }
-dialog#composeModal .compose-body { padding: 16px 20px; }
 dialog#composeModal .compose-topbar {
   display: flex; justify-content: space-between; align-items: center;
   padding: 10px 16px; border-bottom: 1px solid #eee;
@@ -1077,6 +1096,7 @@ dialog#composeModal .sub-tools {
 dialog#composeModal .sub-tools .divider { width: 1px; height: 12px; background: #e8e8e8; }
 dialog#composeModal .editor-container {
   border: 1px solid #e8e8e8; border-radius: 4px; margin-top: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
 }
 dialog#composeModal .editor-toolbar {
   display: flex; align-items: center; gap: 4px;
@@ -1132,7 +1152,7 @@ dialog#composeModal .palette-row .swatch-cell:hover { transform: scale(1.15); bo
 dialog#composeModal .palette-custom { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid #eee; }
 dialog#composeModal .palette-custom input[type=color] { width: 24px; height: 24px; padding: 0; border: 1px solid #d0d0d0; border-radius: 3px; cursor: pointer; background: #fff; }
 dialog#composeModal .editor-content {
-  height: 320px; padding: 16px 20px; outline: none; overflow-y: auto;
+  flex: 1; min-height: 400px; padding: 16px 20px; outline: none; overflow-y: auto;
   font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: #222; background: #fff;
 }
@@ -1146,6 +1166,19 @@ dialog#composeModal .compose-footer .from-info { color: #666; }
 dialog#composeModal .compose-footer .from-info strong { color: #333; }
 dialog#composeModal .compose-footer .footer-actions { margin-left: auto; display: flex; gap: 8px; }
 dialog#composeModal #composeMsg { color: #cf222e; font-size: 12px; min-height: 14px; margin-top: 6px; }
+#imgToolbar {
+  position: absolute; display: none; z-index: 9999;
+  background: rgba(33,33,33,0.9); color: #fff; border-radius: 4px;
+  padding: 2px 0; font-size: 12px; user-select: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+}
+#imgToolbar span {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 28px; height: 22px; padding: 0 6px; cursor: pointer;
+  border-right: 1px solid rgba(255,255,255,0.15);
+}
+#imgToolbar span:last-child { border-right: none; }
+#imgToolbar span:hover { background: rgba(255,255,255,0.18); }
 }
 dialog#labelModal::backdrop { background: rgba(0,0,0,0.3); }
 dialog#labelModal form { padding: 20px 24px; }
@@ -1162,6 +1195,28 @@ dialog#labelModal .color-swatch {
   border: 2px solid transparent;
 }
 dialog#labelModal .color-swatch.active { border-color: #333; }
+dialog#labelModal #conditionWrap { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+dialog#labelModal .cond-item { display: flex; align-items: center; gap: 8px; }
+dialog#labelModal .cond-logic {
+  height: 32px; min-width: 96px; padding: 0 8px; border: 1px solid #dcdfe6; border-radius: 4px;
+  background: #fff; font-size: 12px; color: #333; outline: none; cursor: pointer;
+}
+dialog#labelModal .cond-logic:first-child { visibility: hidden; }
+dialog#labelModal .cond-input {
+  flex: 1; min-width: 0; padding: 8px 12px; border: 1px solid #dcdfe6; border-radius: 4px; font: inherit;
+}
+dialog#labelModal .cond-input:focus { border-color: #0084ff; }
+dialog#labelModal .cond-del {
+  padding: 4px 10px; background: #f56c6c; color: #fff; border: none; border-radius: 4px;
+  cursor: pointer; font-size: 12px; height: 32px;
+}
+dialog#labelModal .cond-del:hover { background: #e25454; }
+dialog#labelModal .cond-del:disabled { opacity: .4; cursor: default; }
+dialog#labelModal .btn-add-cond {
+  margin-top: 8px; padding: 6px 14px; background: #409eff; color: #fff; border: none;
+  border-radius: 4px; cursor: pointer; font-size: 13px;
+}
+dialog#labelModal .btn-add-cond:hover { background: #3685d8; }
 dialog#labelModal .actions { margin-top: 20px; display: flex; justify-content: flex-end; gap: 8px; }
 dialog#labelModal button {
   padding: 6px 14px; border-radius: 6px; font: inherit; cursor: pointer; border: 1px solid #d0d7de;
@@ -1173,6 +1228,23 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 #ctxMenu .ctx-item.ctx-danger { color: #d4351c; }
 #ctxMenu .ctx-item.ctx-danger:hover { background: #fde8e6; }
 #ctxMenu .ctx-item i { width: 14px; text-align: center; }
+
+dialog#confirmModal {
+  border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
+  width: 360px; max-width: 95vw; margin: auto;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.12); color: #333;
+}
+dialog#confirmModal::backdrop { background: rgba(0,0,0,0.3); }
+dialog#confirmModal .confirm-body { padding: 20px 24px; }
+dialog#confirmModal .confirm-title { font-size: 15px; font-weight: 600; margin: 0 0 10px; color: #333; }
+dialog#confirmModal .confirm-msg { font-size: 13px; color: #555; line-height: 1.6; margin: 0 0 18px; }
+dialog#confirmModal .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+dialog#confirmModal button {
+  padding: 6px 16px; border-radius: 6px; font: inherit; cursor: pointer; border: 1px solid #d0d7de;
+}
+dialog#confirmModal .btn-cancel { background: #f2f4f7; color: #555; }
+dialog#confirmModal .btn-danger { background: #cf222e; color: #fff; border: none; }
+dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 </style>
 </head>
 <body>
@@ -1289,18 +1361,28 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     <h3 id="labelModalTitle">新建分类标签</h3>
     <label for="labelName">标签名称</label>
     <input id="labelName" type="text" placeholder="例如：告警" maxlength="20">
-    <label for="labelKeywords">关键词（逗号分隔，主题含任一关键词即归类）</label>
-    <input id="labelKeywords" type="text" placeholder="例如：告警,监控,IMS">
-    <label>颜色</label>
-    <div class="color-row" id="labelColors"></div>
+    <label>筛选条件（按主题匹配）</label>
+    <div id="conditionWrap"></div>
+    <button type="button" class="btn-add-cond" id="addCondBtn">+ 新增条件</button>
     <input id="labelId" type="hidden">
-    <input id="labelColor" type="hidden">
+    <input id="labelColor" type="hidden" value="#0056e0">
     <div class="actions">
       <button type="button" class="btn-cancel" id="labelCancel">取消</button>
       <button type="submit" class="btn-primary" id="labelSave">保存</button>
     </div>
     <div id="labelMsg" style="margin-top:8px;font-size:12px;color:#cf222e;min-height:16px"></div>
   </form>
+</dialog>
+
+<dialog id="confirmModal">
+  <div class="confirm-body">
+    <div class="confirm-title" id="confirmTitle">确认</div>
+    <div class="confirm-msg" id="confirmMsg"></div>
+    <div class="confirm-actions">
+      <button type="button" class="btn-cancel" id="confirmCancel">取消</button>
+      <button type="button" class="btn-danger" id="confirmOk">删除</button>
+    </div>
+  </div>
 </dialog>
 
 <dialog id="composeModal">
@@ -1428,7 +1510,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0 };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, labels: [] };
   var LABEL_COLORS = ['#0056e0', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
@@ -1533,8 +1615,47 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     }, 3000);
   }
 
+  function confirmDialog(opts) {
+    return new Promise(function (resolve) {
+      var modal = document.getElementById('confirmModal');
+      var titleEl = document.getElementById('confirmTitle');
+      var msgEl = document.getElementById('confirmMsg');
+      var okBtn = document.getElementById('confirmOk');
+      var cancelBtn = document.getElementById('confirmCancel');
+      titleEl.textContent = opts.title || '确认';
+      msgEl.textContent = opts.message || '';
+      okBtn.textContent = opts.okText || '删除';
+      okBtn.className = opts.okClass || 'btn-danger';
+      modal.showModal();
+      function done(val) {
+        modal.close();
+        okBtn.onclick = null;
+        cancelBtn.onclick = null;
+        modal.onclose = null;
+        resolve(val);
+      }
+      okBtn.onclick = function () { done(true); };
+      cancelBtn.onclick = function () { done(false); };
+      modal.onclose = function () { if (modal.open === false) resolve(false); };
+    });
+  }
+
   function loadFolders() {
+    var cacheKey = 'dsh-email-folders-' + (state.account || 'default');
+    try {
+      var raw = localStorage.getItem(cacheKey);
+      if (raw) {
+        var cached = JSON.parse(raw);
+        if (cached && cached.value) renderFolders(cached.value);
+      }
+    } catch (e) { /* ignore */ }
     return api('/api/folders', { account: state.account }).then(function (value) {
+      try { localStorage.setItem(cacheKey, JSON.stringify({ value: value, ts: Date.now() })); } catch (e) { /* ignore */ }
+      renderFolders(value);
+    });
+  }
+
+  function renderFolders(value) {
       var accounts = value.accounts || [];
       if (!state.account && accounts.length > 0) state.account = accounts[0];
       var folders = (value.folders || []).slice();
@@ -1626,7 +1747,6 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         inserted = true;
       }
       if (!inserted) nav.appendChild(todoBtn);
-    });
   }
   function markActiveFolder() {
     var btns = document.querySelectorAll('#folders .menu-item');
@@ -1753,6 +1873,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       return res.json().catch(function () { return null; });
     }).then(function (data) {
       var labels = (data && data.ok && data.value) ? data.value : [];
+      state.labels = labels;
       var nav = document.getElementById('labels');
       nav.innerHTML = '';
       labels.forEach(function (l) {
@@ -1773,10 +1894,12 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         btn.appendChild(left);
         var right = document.createElement('div');
         right.style.cssText = 'display:flex;align-items:center;gap:6px;';
-        var dot = document.createElement('span');
-        dot.className = 'label-dot';
-        dot.style.background = l.color || LABEL_COLORS[0];
-        right.appendChild(dot);
+        var edit = document.createElement('button');
+        edit.type = 'button';
+        edit.className = 'label-edit';
+        edit.title = '编辑标签';
+        edit.innerHTML = '<i class="fa-solid fa-pen"></i>';
+        right.appendChild(edit);
         var del = document.createElement('button');
         del.type = 'button';
         del.className = 'label-delete';
@@ -1784,26 +1907,36 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
         del.innerHTML = '<i class="fa-solid fa-trash"></i>';
         right.appendChild(del);
         btn.appendChild(right);
+        edit.onclick = function (ev) {
+          ev.stopPropagation();
+          openLabelModal(l);
+        };
         del.onclick = function (ev) {
           ev.stopPropagation();
-          if (!confirm('删除标签 "' + l.name + '"？')) return;
-          fetch(BASE + '/api/labels/delete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: l.id }),
-          }).then(function (res) {
-            return res.json().catch(function () { return null; });
-          }).then(function (d) {
-            if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
-            if (state.view === 'label' && state.labelId === l.id) {
-              state.view = 'folder';
-              state.labelId = '';
-              state.uid = null;
-              state.offset = 0;
-              loadList();
-            }
-            loadLabels();
-          }).catch(function (err) { showBanner(err.message); });
+          confirmDialog({
+            title: '删除标签',
+            message: '确定删除标签 "' + l.name + '"？删除后不可恢复。',
+            okText: '删除',
+          }).then(function (ok) {
+            if (!ok) return;
+            fetch(BASE + '/api/labels/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: l.id }),
+            }).then(function (res) {
+              return res.json().catch(function () { return null; }).then(function (d) {
+                if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
+                if (state.view === 'label' && state.labelId === l.id) {
+                  state.view = 'folder';
+                  state.labelId = '';
+                  state.uid = null;
+                  state.offset = 0;
+                  loadList();
+                }
+                loadLabels();
+              });
+            }).catch(function (err) { showBanner(err.message); });
+          });
         };
         btn.onclick = function () {
           if (state.view === 'label' && state.labelId === l.id) return;
@@ -1825,39 +1958,80 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     var title = document.getElementById('labelModalTitle');
     var idInput = document.getElementById('labelId');
     var nameInput = document.getElementById('labelName');
-    var kwInput = document.getElementById('labelKeywords');
     var colorInput = document.getElementById('labelColor');
     var msg = document.getElementById('labelMsg');
+    var wrap = document.getElementById('conditionWrap');
     msg.textContent = '';
+    wrap.innerHTML = '';
     if (label) {
       title.textContent = '编辑分类标签';
       idInput.value = label.id;
       nameInput.value = label.name;
-      kwInput.value = (label.keywords || []).join(',');
       colorInput.value = label.color || LABEL_COLORS[0];
+      var conds = (label.conditions && label.conditions.length > 0)
+        ? label.conditions
+        : (label.keywords || []).map(function (k) { return { logic: 'OR', keyword: k }; });
+      if (conds.length === 0) conds = [{ logic: 'OR', keyword: '' }];
+      conds.forEach(function (c) { addCondRow(wrap, c.logic, c.keyword); });
     } else {
       title.textContent = '新建分类标签';
       idInput.value = '';
       nameInput.value = '';
-      kwInput.value = '';
       colorInput.value = LABEL_COLORS[0];
+      addCondRow(wrap, 'OR', '');
     }
-    var colors = document.getElementById('labelColors');
-    colors.innerHTML = '';
-    LABEL_COLORS.forEach(function (c) {
-      var sw = document.createElement('div');
-      sw.className = 'color-swatch' + (colorInput.value === c ? ' active' : '');
-      sw.style.background = c;
-      sw.onclick = function () {
-        colorInput.value = c;
-        var children = colors.children;
-        for (var i = 0; i < children.length; i++) children[i].classList.remove('active');
-        sw.classList.add('active');
-      };
-      colors.appendChild(sw);
-    });
+    refreshCondLogicVisibility(wrap);
     modal.showModal();
     nameInput.focus();
+  }
+
+  function addCondRow(wrap, logic, keyword) {
+    var div = document.createElement('div');
+    div.className = 'cond-item';
+    var sel = document.createElement('select');
+    sel.className = 'cond-logic';
+    sel.innerHTML = '<option value="AND">AND（同时匹配）</option><option value="OR">OR（满足其一）</option>';
+    sel.value = logic;
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'cond-input';
+    input.placeholder = '输入主题关键词';
+    input.value = keyword || '';
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'cond-del';
+    del.textContent = '删除';
+    del.onclick = function () {
+      if (wrap.children.length <= 1) return;
+      div.remove();
+      refreshCondLogicVisibility(wrap);
+    };
+    div.appendChild(sel);
+    div.appendChild(input);
+    div.appendChild(del);
+    wrap.appendChild(div);
+    refreshCondLogicVisibility(wrap);
+  }
+
+  function refreshCondLogicVisibility(wrap) {
+    var items = wrap.children;
+    for (var i = 0; i < items.length; i++) {
+      var sel = items[i].querySelector('.cond-logic');
+      if (sel) sel.style.visibility = i === 0 ? 'hidden' : 'visible';
+      var del = items[i].querySelector('.cond-del');
+      if (del) del.disabled = items.length <= 1;
+    }
+  }
+
+  function collectConditions(wrap) {
+    var items = wrap.querySelectorAll('.cond-item');
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var logic = items[i].querySelector('.cond-logic').value;
+      var kw = items[i].querySelector('.cond-input').value.trim();
+      if (kw) out.push({ logic: i === 0 ? 'OR' : logic, keyword: kw });
+    }
+    return out;
   }
 
   function rowEl(m) {
@@ -2013,16 +2187,22 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       return;
     }
     if (act === 'delete') {
-      if (!confirm('确定删除这封邮件？（移动到已删除文件夹）')) return;
-      fetch(BASE + '/api/move', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account: state.account, folder: folder, uid: uid, target: '已删除' }),
-      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
-        if (d && d.ok) {
-          var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
-          if (li) li.remove();
-          showBanner('已删除');
-        } else showBanner((d && d.error && d.error.message) || '删除失败');
+      confirmDialog({
+        title: '删除邮件',
+        message: '确定删除这封邮件？（移动到已删除文件夹）',
+        okText: '删除',
+      }).then(function (ok) {
+        if (!ok) return;
+        fetch(BASE + '/api/move', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ account: state.account, folder: folder, uid: uid, target: '已删除' }),
+        }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+          if (d && d.ok) {
+            var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
+            if (li) li.remove();
+            showBanner('已删除');
+          } else showBanner((d && d.error && d.error.message) || '删除失败');
+        });
       });
       return;
     }
@@ -2039,7 +2219,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     if (state.offset === 0) listEl.innerHTML = '';
     var params;
     if (state.view === 'label') {
-      params = { account: state.account, label: state.labelId, limit: state.limit };
+      params = { account: state.account, label: state.labelId, limit: state.limit, offset: state.offset };
     } else {
       params = { account: state.account, folder: state.folder, limit: state.limit, offset: state.offset, unreadOnly: state.unreadOnly };
     }
@@ -2047,7 +2227,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
       (value.messages || []).forEach(function (m) { listEl.appendChild(rowEl(m)); });
       var shown = listEl.children.length;
       var more = document.getElementById('more');
-      more.style.display = (state.view === 'label' || shown >= value.count) ? 'none' : '';
+      more.style.display = (shown >= value.count) ? 'none' : '';
       if (shown === 0) {
         var hint = document.createElement('li');
         hint.className = 'hint';
@@ -2059,7 +2239,7 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   function silentRefresh() {
     if (state.offset !== 0) return Promise.resolve();
     var params = state.view === 'label'
-      ? { account: state.account, label: state.labelId, limit: state.limit }
+      ? { account: state.account, label: state.labelId, limit: state.limit, offset: state.offset }
       : { account: state.account, folder: state.folder, limit: state.limit, unreadOnly: state.unreadOnly };
     return api('/api/messages', params).then(function (value) {
       var listEl = document.getElementById('messages');
@@ -2222,19 +2402,26 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   var logoutBtn = document.getElementById('logoutBtn');
   if (logoutBtn) {
     logoutBtn.onclick = function () {
-      if (!confirm('退出登录？将清空已保存的AD密码并回到登录页。')) return;
-      fetch(BASE + '/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
-        .then(function (res) { return res.json().catch(function () { return null; }); })
-        .then(function (d) {
-          if (d && d.ok) {
-            document.getElementById('loginPass').value = '';
-            var u = document.getElementById('loginUser');
-            if (u && !u.value) u.value = '';
-            showLogin();
-          } else {
-            showBanner((d && d.error && d.error.message) || '退出失败');
-          }
-        }).catch(function () { showBanner('退出失败'); });
+      confirmDialog({
+        title: '退出登录',
+        message: '退出登录？将清空已保存的AD密码并回到登录页。',
+        okText: '退出',
+        okClass: 'btn-danger',
+      }).then(function (ok) {
+        if (!ok) return;
+        fetch(BASE + '/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+          .then(function (res) { return res.json().catch(function () { return null; }); })
+          .then(function (d) {
+            if (d && d.ok) {
+              document.getElementById('loginPass').value = '';
+              var u = document.getElementById('loginUser');
+              if (u && !u.value) u.value = '';
+              showLogin();
+            } else {
+              showBanner((d && d.error && d.error.message) || '退出失败');
+            }
+          }).catch(function () { showBanner('退出失败'); });
+      });
     };
   }
   var searchInput = document.getElementById('searchInput');
@@ -2438,6 +2625,119 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   });
   composeEditor.onkeyup = updateTbActive;
   composeEditor.onmouseup = updateTbActive;
+
+  composeEditor.addEventListener('paste', function (e) {
+    var cd = e.clipboardData || window.clipboardData;
+    if (!cd) return;
+    var imgItem = null;
+    for (var i = 0; i < cd.items.length; i++) {
+      var it = cd.items[i];
+      if (it.kind === 'file' && it.type && it.type.indexOf('image/') === 0) { imgItem = it; break; }
+    }
+    if (imgItem) {
+      e.preventDefault();
+      var file = imgItem.getAsFile();
+      if (!file) return;
+      var r = new FileReader();
+      r.onload = function () {
+        var url = String(r.result);
+        restoreSel();
+        var sel = window.getSelection();
+        if (!sel || !sel.rangeCount) { composeEditor.focus(); return; }
+        var range = sel.getRangeAt(0);
+        var img = document.createElement('img');
+        img.src = url;
+        img.style.maxWidth = '100%';
+        img.style.height = 'auto';
+        img.style.display = 'block';
+        img.style.margin = '8px 0';
+        img.onload = function () {
+          var maxW = composeEditor.clientWidth - 24;
+          if (maxW > 0 && img.naturalWidth > maxW) {
+            img.style.width = maxW + 'px';
+          } else if (img.naturalWidth > 0) {
+            img.style.width = img.naturalWidth + 'px';
+          }
+        };
+        range.deleteContents();
+        range.insertNode(img);
+        range.setStartAfter(img);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        saveSel();
+      };
+      r.readAsDataURL(file);
+      return;
+    }
+    var html = cd.getData && cd.getData('text/html');
+    if (html && /<table[\\s>]/i.test(html)) {
+      e.preventDefault();
+      var clean = html;
+      clean = clean.replace(/<!--[\\s\\S]*?-->/g, '');
+      clean = clean.replace(/<o:p>[\\s\\S]*?<\\/o:p>/gi, '');
+      clean = clean.replace(/<\\/?(col|xml|st1|w:|m:|v:)[^>]*>/gi, '');
+      clean = clean.replace(/<([a-zA-Z0-9]+)[^>]*>/g, function (m, tag) {
+        var t = tag.toLowerCase();
+        var allow = ['table','thead','tbody','tfoot','tr','td','th','colgroup','col','span','br','b','strong','i','em','u','s','p','div'];
+        if (allow.indexOf(t) === -1) return '';
+        return '<' + t + '>';
+      });
+      clean = clean.replace(/<\\/[a-zA-Z0-9]+>/g, function (m) { return m.toLowerCase(); });
+      restoreSel();
+      composeEditor.focus();
+      try { document.execCommand('insertHTML', false, clean); } catch (_) { /* fallback below */ }
+      saveSel();
+      return;
+    }
+  });
+
+  var imgToolbar = document.createElement('div');
+  imgToolbar.id = 'imgToolbar';
+  imgToolbar.innerHTML = '<span data-act="zoomin" title="放大">＋</span>'
+    + '<span data-act="zoomout" title="缩小">－</span>'
+    + '<span data-act="reset" title="原始大小">1:1</span>'
+    + '<span data-act="fit" title="适应宽度">⇔</span>';
+  document.body.appendChild(imgToolbar);
+  var imgTarget = null;
+  function showImgToolbar(img) {
+    imgTarget = img;
+    var r = img.getBoundingClientRect();
+    imgToolbar.style.display = 'flex';
+    imgToolbar.style.left = (r.left + window.scrollX + 4) + 'px';
+    imgToolbar.style.top = (r.top + window.scrollY - 28) + 'px';
+  }
+  function hideImgToolbar() {
+    imgToolbar.style.display = 'none';
+    imgTarget = null;
+  }
+  imgToolbar.addEventListener('mousedown', function (e) {
+    e.preventDefault();
+    var t = e.target;
+    var act = t.getAttribute && t.getAttribute('data-act');
+    if (!act || !imgTarget) return;
+    var cur = imgTarget.clientWidth || imgTarget.naturalWidth || 100;
+    var natural = imgTarget.naturalWidth || cur;
+    if (act === 'zoomin') cur = Math.min(cur * 1.2, natural * 4);
+    else if (act === 'zoomout') cur = Math.max(cur * 0.8, 40);
+    else if (act === 'reset') cur = natural;
+    else if (act === 'fit') cur = composeEditor.clientWidth - 24;
+    imgTarget.style.width = cur + 'px';
+    imgTarget.style.height = 'auto';
+    showImgToolbar(imgTarget);
+  });
+  composeEditor.addEventListener('click', function (e) {
+    var t = e.target;
+    if (t && t.tagName === 'IMG') {
+      showImgToolbar(t);
+    } else {
+      hideImgToolbar();
+    }
+  });
+  document.addEventListener('mousedown', function (e) {
+    if (!imgToolbar.contains(e.target) && !composeEditor.contains(e.target)) hideImgToolbar();
+  });
+  window.addEventListener('scroll', hideImgToolbar, true);
 
   document.getElementById('composeCcToggle').onclick = function () {
     var row = document.getElementById('composeCcRow');
@@ -2780,19 +3080,24 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
   document.getElementById('labelCancel').onclick = function () {
     document.getElementById('labelModal').close();
   };
+  document.getElementById('addCondBtn').onclick = function () {
+    addCondRow(document.getElementById('conditionWrap'), 'AND', '');
+  };
   document.getElementById('labelForm').onsubmit = function (e) {
     e.preventDefault();
     var id = document.getElementById('labelId').value || ('lbl_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6));
     var name = document.getElementById('labelName').value.trim();
-    var kws = document.getElementById('labelKeywords').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    var conditions = collectConditions(document.getElementById('conditionWrap'));
+    var kws = conditions.map(function (c) { return c.keyword; });
     var color = document.getElementById('labelColor').value || LABEL_COLORS[0];
     var msg = document.getElementById('labelMsg');
     if (!name) { msg.textContent = '请填写标签名称'; return; }
+    if (conditions.length === 0) { msg.textContent = '请至少添加一个关键词条件'; return; }
     msg.textContent = '';
     fetch(BASE + '/api/labels', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, name: name, keywords: kws, color: color }),
+      body: JSON.stringify({ id: id, name: name, keywords: kws, conditions: conditions, color: color }),
     }).then(function (res) {
       return res.json().catch(function () { return null; }).then(function (d) {
         if (!res.ok || !d || !d.ok) throw new Error((d && d.error && d.error.message) || ('HTTP ' + res.status));
@@ -2848,9 +3153,11 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     }).then(function () {
       btn.textContent = '已保存，加载中…';
       showMain();
-      loadFolders().then(loadList).then(loadLabels).then(loadTodoCount).catch(function (err) {
+      loadFolders().then(loadList).catch(function (err) {
         showBanner(err.message);
       });
+      loadLabels();
+      loadTodoCount();
     }).catch(function (err) {
       msg.textContent = err.message;
       btn.disabled = false;
@@ -2858,10 +3165,11 @@ dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80
     });
   };
 
+  loadLabels();
+  loadTodoCount();
   loadFolders().then(function () {
     showMain();
     loadList();
-    loadLabels();
   }).catch(function (err) {
     var msg = String(err && err.message || err);
     if (msg.indexOf('未配置') >= 0 || msg.indexOf('未填写') >= 0 || msg.indexOf('user') >= 0 || msg.indexOf('password') >= 0 || msg.indexOf('host') >= 0) {

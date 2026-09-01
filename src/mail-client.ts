@@ -4,6 +4,7 @@ import { mkdir, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { Readable } from 'node:stream'
 import type { ResolvedEmailConfig, ResolvedEmailSettings } from './config.js'
+import type { EmailLabelCondition } from './settings.js'
 import { flattenAddresses, parseRawMessage, sanitizeFilename } from './parse.js'
 import type {
   EmailAttachmentMeta,
@@ -132,6 +133,7 @@ export class EmailPool {
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly labelCache = new Map<string, { value: EmailListResult; expireAt: number }>()
   private readonly sourceCache = new Map<string, { source: Buffer; expireAt: number }>()
+  private readonly folderCache = new Map<string, { value: EmailFoldersResult; expireAt: number }>()
   private idleTimer: NodeJS.Timeout | undefined
 
   constructor(private readonly settings: ResolvedEmailSettings) {}
@@ -294,59 +296,84 @@ export class EmailPool {
   }
 
   /**
-   * Cross-folder listing for the label view. Results are cached per
-   * (account, sorted keywords, limit) for `LABEL_CACHE_TTL_MS` so repeat
-   * clicks on the same label return instantly; the first hit still pays the
-   * full parallel-scan cost. Cache entries are invalidated whenever labels
-   * are created/updated/deleted via `invalidateLabelCache()`.
+   * Server-side subject search over INBOX only. Uses IMAP SEARCH so the
+   * server walks its index instead of us pulling envelopes client-side;
+   * this covers the whole mailbox (not just the last N) and is far faster.
+   *
+   * Condition grouping: conditions are split into AND-groups — a run of
+   * consecutive AND conditions forms one group (all keywords must match),
+   * and an OR condition starts a new group. Groups are unioned. The first
+   * condition's logic is ignored (it's the seed). Within a group, keywords
+   * are searched in parallel and intersected client-side; across groups the
+   * resulting uid sets are unioned. This avoids IMAP nested-OR quirks (QQ
+   * etc.) while supporting arbitrary AND/OR combinations.
+   *
+   * Falls back to legacy `keywords` (all-OR) when `conditions` is empty.
+   *
+   * Results are cached per (account, conditions, limit, offset) for
+   * `LABEL_CACHE_TTL_MS`. Cache is invalidated on label mutations.
    */
-  async listByLabel(accountName: string | undefined, keywords: string[], limit: number): Promise<EmailListResult> {
+  async listByLabel(
+    accountName: string | undefined,
+    keywords: string[],
+    limit: number,
+    offset = 0,
+    conditions: EmailLabelCondition[] = [],
+  ): Promise<EmailListResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
-    const lowered = keywords.map(k => k.toLowerCase().trim()).filter(k => k !== '')
-    const cacheKey = name + '|' + lowered.join(',') + '|' + limit
+    // Normalize: prefer conditions; fall back to legacy keywords as all-OR.
+    const conds = conditions.length > 0
+      ? conditions.map(c => ({ logic: c.logic, keyword: c.keyword.trim() })).filter(c => c.keyword !== '')
+      : keywords.map(k => ({ logic: 'OR' as const, keyword: k.trim() })).filter(c => c.keyword !== '')
+    const cacheKey = name + '|' + JSON.stringify(conds) + '|' + limit + '|' + offset
     const now = Date.now()
     const cached = this.labelCache.get(cacheKey)
     if (cached && cached.expireAt > now) return cached.value
 
-    const folderRows = await this.folders(name, true)
-    const perFolder = Math.min(limit * 3, 100)
-    const results = await Promise.all(folderRows.folders.map(async (row) => {
-      try {
-        const client = this.createImap(cfg)
-        await client.connect()
-        try {
-          await client.mailboxOpen(row.path, { readOnly: true })
-          const total = client.mailbox === false ? 0 : client.mailbox.exists
-          if (total === 0) return [] as ListedMessage[]
-          const start = Math.max(1, total - perFolder + 1)
-          const fetched = await client.fetchAll(start + ':*', { uid: true, envelope: true, flags: true, size: true, bodyStructure: true })
-          const out: ListedMessage[] = []
-          for (const m of fetched) {
-            if (lowered.length === 0) continue
-            const env = m.envelope as any
-            const subj = String(env?.subject || '').toLowerCase()
-            if (lowered.some(k => subj.includes(k))) {
-              const msg = listedFrom(m, m.size, structureHasAttachment(m.bodyStructure))
-              out.push({ ...msg, folder: row.path })
-            }
-          }
-          return out
-        } finally {
-          await client.logout().catch(() => { /* best-effort */ })
-        }
-      } catch {
-        return [] as ListedMessage[]
+    const folderName = cfg.inboxFolder || 'INBOX'
+    let messages: ListedMessage[] = []
+    let count = 0
+    if (conds.length > 0) {
+      // Partition into AND-groups: each OR starts a new group.
+      const groups: { logic: 'AND' | 'OR', keyword: string }[][] = []
+      for (const c of conds) {
+        if (groups.length === 0 || c.logic === 'OR') groups.push([c])
+        else groups[groups.length - 1].push(c)
       }
-    }))
-    const collected = results.flat()
-    collected.sort((a, b) => {
-      const ta = Date.parse(a.date || '') || 0
-      const tb = Date.parse(b.date || '') || 0
-      return tb - ta
-    })
-    const messages = collected.slice(0, limit)
-    const value: EmailListResult = { account: name, count: collected.length, folder: '', messages }
+      try {
+        messages = await this.withImap(name, folderName, async (client) => {
+          // For each group, parallel SEARCH each keyword; intersect within group.
+          const groupUidSets = await Promise.all(groups.map(async (g) => {
+            const found = await Promise.all(
+              g.map(c => client.search({ subject: c.keyword }, { uid: true })),
+            )
+            const sets = found.map(r => new Set(r === false ? [] : r as number[]))
+            if (sets.length === 0) return new Set<number>()
+            // intersect
+            let acc = sets[0]
+            for (let i = 1; i < sets.length; i++) {
+              const next = new Set<number>()
+              for (const u of acc) if (sets[i].has(u)) next.add(u)
+              acc = next
+            }
+            return acc
+          }))
+          // union across groups
+          const uids = [...new Set(groupUidSets.flatMap(s => [...s]))].sort((a, b) => a - b)
+          count = uids.length
+          if (count === 0) return [] as ListedMessage[]
+          const start = Math.max(0, uids.length - offset - limit)
+          const end = uids.length - offset
+          const window = uids.slice(start, end)
+          return this.fetchListed(client, window)
+        })
+      } catch {
+        messages = []
+        count = 0
+      }
+    }
+    const value: EmailListResult = { account: name, count, folder: folderName, messages }
     this.labelCache.set(cacheKey, { value, expireAt: now + LABEL_CACHE_TTL_MS })
     return value
   }
@@ -610,7 +637,11 @@ export class EmailPool {
 
   async folders(accountName: string | undefined, subscribedOnly: boolean): Promise<EmailFoldersResult> {
     const name = this.resolveName(accountName)
-    return this.withImap(name, null, async (client) => {
+    const cacheKey = name + '|' + (subscribedOnly ? '1' : '0')
+    const now = Date.now()
+    const cached = this.folderCache.get(cacheKey)
+    if (cached && cached.expireAt > now) return cached.value
+    const value = await this.withImap(name, null, async (client) => {
       const list = await client.list()
       const rows = list.filter(row => !subscribedOnly || row.subscribed !== false)
       const folders: EmailFolderRow[] = []
@@ -635,6 +666,13 @@ export class EmailPool {
       }
       return { account: name, folders }
     })
+    this.folderCache.set(cacheKey, { value, expireAt: now + 24 * 60 * 60 * 1000 })
+    return value
+  }
+
+  invalidateFolderCache(accountName?: string | undefined): void {
+    if (accountName === undefined) this.folderCache.clear()
+    else this.folderCache.delete(this.resolveName(accountName) + '|0'), this.folderCache.delete(this.resolveName(accountName) + '|1')
   }
 
   async downloadAttachment(accountName: string | undefined, folder: string, uid: number, index: number, workspaceHint?: string): Promise<EmailAttachmentResult> {

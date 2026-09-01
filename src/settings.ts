@@ -9,6 +9,10 @@ export const EmailLabelSchema = z.object({
   id: z.string().default(''),
   name: z.string().default(''),
   keywords: z.array(z.string()).default([]),
+  conditions: z.array(z.object({
+    logic: z.union([z.const('AND'), z.const('OR')]).default('OR'),
+    keyword: z.string().default(''),
+  })).default([]),
   color: z.string().default(''),
 })
 
@@ -53,10 +57,16 @@ export const EmailSettingsSchema = z.object({
   todos: z.array(EmailTodoSchema).default([]),
 })
 
+export interface EmailLabelCondition {
+  logic: 'AND' | 'OR'
+  keyword: string
+}
+
 export interface EmailLabel {
   id: string
   name: string
   keywords: string[]
+  conditions: EmailLabelCondition[]
   color: string
 }
 
