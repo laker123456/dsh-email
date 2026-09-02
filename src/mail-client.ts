@@ -127,6 +127,13 @@ interface ImapEntry {
  * One mailbox pool for the whole plugin: pooled IMAP connections per
  * account plus pooled SMTP transporters, with idle sweep and error eviction.
  */
+/** Translate resolved TLS options into the shape ImapFlow / nodemailer expect. */
+function tlsOptionsFor(cfg: ResolvedEmailConfig): { rejectUnauthorized?: false; ca?: Buffer } | undefined {
+  if (cfg.tls.insecure) return { rejectUnauthorized: false }
+  if (cfg.tls.ca) return { ca: cfg.tls.ca }
+  return undefined
+}
+
 export class EmailPool {
   private readonly imaps = new Map<string, ImapEntry>()
   private readonly smtps = new Map<string, Transporter>()
@@ -178,6 +185,7 @@ export class EmailPool {
       connectionTimeout: cfg.imap.connectionTimeoutMs ?? 30000,
       greetingTimeout: 30000,
       socketTimeout: cfg.imap.socketTimeoutMs ?? 60000,
+      tls: tlsOptionsFor(cfg),
     })
   }
 
@@ -264,6 +272,7 @@ export class EmailPool {
         socketTimeout: 60000,
         maxConnections: 2,
         maxMessages: 50,
+        tls: tlsOptionsFor(cfg),
       })
       this.smtps.set(name, t)
     }

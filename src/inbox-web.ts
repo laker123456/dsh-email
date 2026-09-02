@@ -2,11 +2,19 @@ import { mkdir, writeFile, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
+import { createRequire } from 'node:module'
 import { clampInt, PROVIDER_NAMES, PROVIDER_PRESETS } from './config.js'
 import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
 import { SETTINGS_NAMESPACE, validateSettingsValue, type EmailSettingsValue } from './settings.js'
 import { isLoopbackRequest } from './web.js'
+
+// time.weoa.com uses WeBank's enterprise CA, which isn't in Node's bundled cacert.pem.
+// undici's Agent scopes the TLS downgrade to this dispatcher instead of setting
+// NODE_TLS_REJECT_UNAUTHORIZED=0 process-wide. Node 18+ bundles undici.
+const nodeRequire = createRequire(import.meta.url)
+const undici: any = nodeRequire('undici')
+const intranetDispatcher = new undici.Agent({ connect: { rejectUnauthorized: false } })
 
 export const INBOX_ROUTE = '/_dsh/dsh-email/inbox'
 
@@ -435,6 +443,7 @@ async function handleDirSearch(req: any, res: any): Promise<void> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': auth.key!, 'OPERATOR': auth.username! },
       body: JSON.stringify({ queryKey: q }),
+      dispatcher: intranetDispatcher,
     })
     const j = await r.json() as any
     if (j?.CODE !== '0') {

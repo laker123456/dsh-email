@@ -1,6 +1,7 @@
 import { homedir } from 'node:os'
 import { parse as parseYaml } from 'yaml'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 
 export type ProviderName = 'qq' | '163' | '126' | 'sina' | 'aliyun' | 'gmail' | 'outlook' | 'icloud' | 'webank' | 'coremail'
 
@@ -26,6 +27,16 @@ export interface AccountConfig {
   imap?: ImapConfig
   smtp?: SmtpConfig
   inboxFolder?: string
+  /** Per-account TLS options. `insecure` and `caPath` are mutually exclusive. */
+  tls?: AccountTlsOptions
+}
+
+/** Per-account TLS options for intranet/self-signed CA scenarios. */
+export interface AccountTlsOptions {
+  /** Skip server certificate verification. Explicit security downgrade. */
+  insecure?: boolean
+  /** Path to a PEM file with an extra CA to trust. Preserves verification. */
+  caPath?: string
 }
 
 export interface EmailConfig extends AccountConfig {
@@ -54,6 +65,8 @@ export interface EmailConfig extends AccountConfig {
 export interface ProviderPreset {
   imap: { host: string; port: number; secure: boolean }
   smtp: { host: string; port: number; secure: boolean }
+  /** Default TLS options for this provider (e.g. webank intranet self-signed CA). */
+  tls?: AccountTlsOptions
 }
 
 export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
@@ -65,8 +78,15 @@ export const PROVIDER_PRESETS: Record<string, ProviderPreset> = {
   gmail: { imap: { host: 'imap.gmail.com', port: 993, secure: true }, smtp: { host: 'smtp.gmail.com', port: 465, secure: true } },
   outlook: { imap: { host: 'outlook.office365.com', port: 993, secure: true }, smtp: { host: 'smtp.office365.com', port: 587, secure: false } },
   icloud: { imap: { host: 'imap.mail.me.com', port: 993, secure: true }, smtp: { host: 'smtp.mail.me.com', port: 587, secure: false } },
-  // WeBank (Coremail deployment, intranet-only hosts)
-  webank: { imap: { host: 'wemail.webank.com', port: 993, secure: true }, smtp: { host: 'wemail.webank.com', port: 465, secure: true } },
+  // WeBank (Coremail deployment, intranet-only hosts). WeBank OA enterprise CA is
+  // not in Node's bundled cacert.pem, so default to skipping verification — this
+  // is a per-provider downgrade, scoped only to webank IMAP/SMTP connections.
+  // Switch to tls.caPath once the enterprise CA PEM is available.
+  webank: {
+    imap: { host: 'wemail.webank.com', port: 993, secure: true },
+    smtp: { host: 'wemail.webank.com', port: 465, secure: true },
+    tls: { insecure: true },
+  },
 }
 
 export const PROVIDER_NAMES = [...Object.keys(PROVIDER_PRESETS), 'coremail']
@@ -101,6 +121,8 @@ export interface ResolvedEmailConfig {
   imap: ImapConfig & { host: string; port: number; secure: boolean }
   smtp: SmtpConfig & { host: string; port: number; secure: boolean }
   inboxFolder: string
+  /** Resolved TLS options. `ca` is the loaded PEM Buffer when `caPath` is set. */
+  tls: { insecure: boolean; ca?: Buffer }
 }
 
 /** Fully resolved plugin settings: the account map plus shared policy. */
@@ -219,6 +241,7 @@ function resolveAccount(name: string, common: AccountConfig, acc: AccountConfig,
     }
   }
   const password = acc.password ?? common.password ?? (allowEnvPassword ? process.env[EMAIL_PASSWORD_ENV] ?? '' : '')
+  const tlsOpts = acc.tls ?? common.tls ?? preset?.tls
   const imap = {
     host: acc.imap?.host ?? common.imap?.host ?? preset?.imap.host,
     port: acc.imap?.port ?? common.imap?.port ?? preset?.imap.port,
@@ -231,6 +254,7 @@ function resolveAccount(name: string, common: AccountConfig, acc: AccountConfig,
     port: acc.smtp?.port ?? common.smtp?.port ?? preset?.smtp.port,
     secure: acc.smtp?.secure ?? common.smtp?.secure ?? preset?.smtp.secure,
   }
+  const tls = resolveTls(name, tlsOpts)
   const problems: string[] = []
   if (user === '') problems.push(`账号 "${name}" 的 user（邮箱地址）未填写`)
   if (password === '') problems.push(`账号 "${name}" 的 password 未填写（单账号可用环境变量 ${EMAIL_PASSWORD_ENV}）`)
@@ -245,7 +269,29 @@ function resolveAccount(name: string, common: AccountConfig, acc: AccountConfig,
     imap: { ...imap, host: imap.host!, port: imap.port!, secure: imap.secure! },
     smtp: { ...smtp, host: smtp.host!, port: smtp.port!, secure: smtp.secure! },
     inboxFolder: (acc.inboxFolder ?? common.inboxFolder ?? '').trim() || 'INBOX',
+    tls,
   }
+}
+
+/** Resolve and validate per-account TLS options. `insecure` and `caPath` are mutually exclusive. */
+function resolveTls(name: string, opts: AccountTlsOptions | undefined): { insecure: boolean; ca?: Buffer } {
+  const insecure = opts?.insecure === true
+  const caPath = opts?.caPath?.trim()
+  if (insecure && caPath) {
+    throw new Error(`dsh-email：账号 "${name}" 的 tls.insecure 与 tls.caPath 不能同时设置（要么跳过校验，要么信任指定 CA，二选一）`)
+  }
+  if (caPath === '') return { insecure }
+  if (caPath === undefined) return { insecure }
+  let ca: Buffer
+  try {
+    ca = readFileSync(caPath)
+  } catch (error) {
+    throw new Error(`dsh-email：账号 "${name}" 的 tls.caPath "${caPath}" 读取失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (!/-----BEGIN CERTIFICATE-----/.test(ca.toString('utf8'))) {
+    throw new Error(`dsh-email：账号 "${name}" 的 tls.caPath "${caPath}" 不是合法的 PEM 证书文件（缺 "-----BEGIN CERTIFICATE-----" 标记）`)
+  }
+  return { insecure, ca }
 }
 
 /** v0.1-compatible wrapper: resolve the single (or default) account. */
