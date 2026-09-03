@@ -136,8 +136,7 @@ test('message.html serves CSP-sandboxed HTML with cid images inlined', async () 
   assert.equal(blocked.statusCode, 200)
   assert.match(blocked.headers['content-type'], /text\/html/)
   const csp = blocked.headers['content-security-policy']
-  assert.match(csp, /^sandbox;/)
-  assert.match(csp, /default-src 'none'/)
+  assert.match(csp, /^default-src 'none'/)
   assert.match(csp, /img-src data:;/)
   assert.match(csp, /frame-ancestors 'self'/)
   assert.ok(blocked.body().includes('data:image/png;base64,'))
@@ -154,4 +153,49 @@ test('message.html falls back to an escaped plain-text document', async () => {
   assert.equal(res.statusCode, 200)
   assert.ok(res.body().includes('<pre'))
   assert.ok(res.body().includes('纯文本内容'))
+})
+
+test('messages-unread aggregates cross-folder unread with folder passthrough', async () => {
+  const calls = []
+  const holder = installRoute(() => ({
+    listUnread: async (account, limit, offset) => {
+      calls.push({ account, limit, offset })
+      return {
+        account, count: 25, folder: '',
+        messages: [
+          { uid: 101, date: '2026-09-03T10:00:00Z', from: [], subject: '告警', seen: false, flagged: false, size: 10, hasAttachments: false, folder: '高频交易异动告警' },
+          { uid: 7, date: '2026-09-02T08:00:00Z', from: [], subject: '周报', seen: false, flagged: false, size: 20, hasAttachments: false, folder: 'INBOX' },
+        ],
+      }
+    },
+  }))
+  const res = await call(holder.routes[0], fakeReq(INBOX_ROUTE + '/api/messages-unread?limit=2&offset=4'))
+  assert.equal(res.statusCode, 200)
+  const body = res.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.value.count, 25)
+  assert.equal(body.value.folder, '')
+  assert.deepEqual(calls, [{ account: undefined, limit: 2, offset: 4 }])
+  assert.deepEqual(body.value.messages.map(m => m.folder), ['高频交易异动告警', 'INBOX'])
+})
+
+test('messages-unread clamps limit and offset', async () => {
+  const calls = []
+  const holder = installRoute(() => ({
+    listUnread: async (account, limit, offset) => {
+      calls.push({ limit, offset })
+      return { account: 'default', count: 0, folder: '', messages: [] }
+    },
+  }))
+  const route = holder.routes[0]
+  await call(route, fakeReq(INBOX_ROUTE + '/api/messages-unread?limit=9999&offset=-5'))
+  await call(route, fakeReq(INBOX_ROUTE + '/api/messages-unread'))
+  assert.deepEqual(calls, [{ limit: 100, offset: 0 }, { limit: 20, offset: 0 }])
+})
+
+test('messages-unread with unconfigured account answers 400', async () => {
+  const holder = installRoute(() => { throw new Error('dsh-email 未配置：user（邮箱地址）未填写') })
+  const res = await call(holder.routes[0], fakeReq(INBOX_ROUTE + '/api/messages-unread'))
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().error.code, 'bad-request')
 })

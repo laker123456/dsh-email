@@ -420,6 +420,53 @@ export class EmailPool {
     })
   }
 
+  /**
+   * 跨全部文件夹聚合未读邮件（虚拟「未读邮件」分组）。每个文件夹
+   * SEARCH UNSEEN 取最新 offset+limit 封的 envelope，按日期倒序合并
+   * 分页；每行带 folder。数超大（告警文件夹可达十几万）也只取每
+   * 文件夹最新一窗，深分页时逐次扩窗。
+   */
+  async listUnread(accountName: string | undefined, limit: number, offset: number): Promise<EmailListResult> {
+    const name = this.resolveName(accountName)
+    const result = await this.withImap(name, null, async (client) => {
+      const list = await client.list()
+      const all: ListedMessage[] = []
+      let count = 0
+      for (const row of list) {
+        let uids: number[] = []
+        try {
+          await client.mailboxOpen(row.path, { readOnly: true })
+          const found = await client.search({ seen: false }, { uid: true })
+          uids = found === false ? [] : (found as number[])
+        } catch {
+          // 特殊/不可选邮箱（如病毒邮件）直接跳过
+          continue
+        }
+        if (uids.length === 0) continue
+        count += uids.length
+        const window = uids.slice(-(offset + limit))
+        const fetched = await client.fetchAll(
+          window,
+          { uid: true, envelope: true, flags: true, size: true, bodyStructure: true },
+          { uid: true },
+        )
+        for (const m of fetched) {
+          all.push({ ...listedFrom(m, m.size, structureHasAttachment(m.bodyStructure)), folder: row.path })
+        }
+      }
+      all.sort((a, b) => {
+        const ta = Date.parse(a.date || '') || 0
+        const tb = Date.parse(b.date || '') || 0
+        return tb - ta
+      })
+      return { account: name, count, folder: '', messages: all.slice(offset, offset + limit) }
+    })
+    // 我们切换过 mailbox，使池的 selected 记录失效，避免后续操作落在错误的文件夹
+    const entry = this.imaps.get(name)
+    if (entry) entry.selected = null
+    return result
+  }
+
   async search(accountName: string | undefined, query: string, folder: string, limit: number): Promise<EmailSearchResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)

@@ -734,6 +734,14 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
       responseJson(res, 200, { ok: true, value })
       return
     }
+    if (sub === '/api/messages-unread') {
+      const pool = getPool()
+      const limit = clampInt(Number(url.searchParams.get('limit') ?? 20), 20, 1, 100)
+      const offset = clampInt(Number(url.searchParams.get('offset') ?? 0), 0, 0, 100000)
+      const value = await pool.listUnread(account, limit, offset)
+      responseJson(res, 200, { ok: true, value })
+      return
+    }
     if (sub === '/api/search') {
       const pool = getPool()
       const q = (url.searchParams.get('q') ?? '').trim()
@@ -881,6 +889,7 @@ button, select, input { font: inherit; }
 .menu-item.active .menu-item-left i { color: #0056e0; }
 .menu-item-left span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .count-badge { font-size: 11px; color: #0056e0; font-weight: bold; flex-shrink: 0; }
+.folder-chip { font-size: 11px; color: #66788f; background: #eef2f7; border-radius: 4px; padding: 0 6px; flex-shrink: 0; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .unread-dot { width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .sidebar-footer { margin-top: auto; padding: 8px 12px; font-size: 11px; color: #8a97a8; }
 
@@ -1683,6 +1692,37 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var nav = document.getElementById('folders');
       nav.innerHTML = '';
       var trashIdx = -1;
+      var unreadBtn = document.createElement('button');
+      unreadBtn.type = 'button';
+      unreadBtn.id = 'unreadBtn';
+      unreadBtn.className = 'menu-item';
+      if (state.view === 'unread') unreadBtn.classList.add('active');
+      var uLeft = document.createElement('div');
+      uLeft.className = 'menu-item-left';
+      var uIcon = document.createElement('i');
+      uIcon.className = 'fa-solid fa-envelope-circle-check';
+      uIcon.style.cssText = 'width:16px;text-align:center;color:#666;';
+      var uLabel = document.createElement('span');
+      uLabel.textContent = '未读邮件';
+      uLeft.appendChild(uIcon);
+      uLeft.appendChild(uLabel);
+      unreadBtn.appendChild(uLeft);
+      var uCount = document.createElement('span');
+      uCount.id = 'unreadCount';
+      uCount.className = 'count-badge';
+      uCount.style.display = 'none';
+      unreadBtn.appendChild(uCount);
+      unreadBtn.onclick = function () {
+        if (state.view === 'unread') return;
+        state.view = 'unread';
+        state.uid = null;
+        state.offset = 0;
+        markActiveFolder();
+        markActiveLabel();
+        openUnreadView();
+      };
+      var unreadTotal = 0;
+      var unreadInserted = false;
       folders.forEach(function (f, i) {
         var btn = document.createElement('button');
         btn.type = 'button';
@@ -1718,8 +1758,15 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           loadList();
         };
         nav.appendChild(btn);
+        if (f.unread > 0) unreadTotal += f.unread;
+        if (f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX') {
+          nav.appendChild(unreadBtn);
+          unreadInserted = true;
+        }
         if (trashIdx < 0 && (f.specialUse === '\\\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
       });
+      if (!unreadInserted) nav.insertBefore(unreadBtn, nav.firstChild);
+      setUnreadBadge(unreadTotal);
       var todoBtn = document.createElement('button');
       todoBtn.type = 'button';
       todoBtn.id = 'todoBtn';
@@ -1764,6 +1811,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
     var todoBtn = document.getElementById('todoBtn');
     if (todoBtn) todoBtn.classList.toggle('active', state.view === 'todo');
+    var unreadBtn = document.getElementById('unreadBtn');
+    if (unreadBtn) unreadBtn.classList.toggle('active', state.view === 'unread');
   }
   function markActiveLabel() {
     var btns = document.querySelectorAll('#labels .menu-item');
@@ -1772,8 +1821,9 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
     var todoBtn = document.getElementById('todoBtn');
     if (todoBtn) todoBtn.classList.toggle('active', state.view === 'todo');
+    var unreadBtn = document.getElementById('unreadBtn');
+    if (unreadBtn) unreadBtn.classList.toggle('active', state.view === 'unread');
   }
-
   function loadTodoCount() {
     return fetch(BASE + '/api/todos').then(function (res) {
       return res.json().catch(function () { return null; });
@@ -1875,6 +1925,69 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
     var more = document.getElementById('more');
     if (more) more.style.display = 'none';
+  }
+
+  function fmtUnreadCount(n) {
+    return String(n);
+  }
+  function setUnreadBadge(total) {
+    var badge = document.getElementById('unreadCount');
+    if (!badge) return;
+    badge.dataset.total = String(total);
+    if (total > 0) {
+      badge.textContent = fmtUnreadCount(total);
+      badge.title = '未读 ' + total;
+      badge.style.display = '';
+    } else {
+      badge.style.display = 'none';
+    }
+  }
+  function bumpUnreadBadge(delta) {
+    var badge = document.getElementById('unreadCount');
+    if (!badge || !badge.dataset.total) return;
+    setUnreadBadge(Math.max(0, parseInt(badge.dataset.total, 10) + delta));
+  }
+  function openUnreadView() {
+    state.labelId = '';
+    state.offset = 0;
+    var listEl = document.getElementById('messages');
+    listEl.innerHTML = '';
+    var loading = document.createElement('li');
+    loading.className = 'hint';
+    loading.textContent = '正在聚合各文件夹的未读邮件…';
+    listEl.appendChild(loading);
+    var more = document.getElementById('more');
+    if (more) more.style.display = 'none';
+    loadUnreadList();
+  }
+  function loadUnreadList() {
+    var listEl = document.getElementById('messages');
+    if (state.offset === 0) listEl.innerHTML = '';
+    return api('/api/messages-unread', { account: state.account, limit: state.limit, offset: state.offset }).then(function (value) {
+      var had = listEl.querySelectorAll('li[data-uid]').length;
+      var msgs = value.messages || [];
+      msgs.forEach(function (m) { listEl.appendChild(unreadRowEl(m)); });
+      if (typeof value.count === 'number' && value.count > 0) setUnreadBadge(value.count);
+      var shown = listEl.querySelectorAll('li[data-uid]').length;
+      var more = document.getElementById('more');
+      more.style.display = (shown >= value.count) ? 'none' : '';
+      if (had === 0 && msgs.length === 0) {
+        var hint = document.createElement('li');
+        hint.className = 'hint';
+        hint.textContent = '没有未读邮件';
+        listEl.appendChild(hint);
+      }
+    }).catch(function (err) { showBanner(err.message); });
+  }
+  function unreadRowEl(m) {
+    var li = rowEl(m);
+    var meta = li.querySelector('.meta');
+    var chip = document.createElement('span');
+    chip.className = 'folder-chip';
+    chip.textContent = folderLabel({ name: m.folder, path: m.folder });
+    chip.title = m.folder || '';
+    if (meta && meta.firstChild) meta.insertBefore(chip, meta.firstChild);
+    return li;
   }
 
   function loadLabels() {
@@ -2247,6 +2360,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   }
   function silentRefresh() {
     if (state.offset !== 0) return Promise.resolve();
+    if (state.view === 'unread' || state.view === 'todo') return Promise.resolve();
     var params = state.view === 'label'
       ? { account: state.account, label: state.labelId, limit: state.limit, offset: state.offset }
       : { account: state.account, folder: state.folder, limit: state.limit, unreadOnly: state.unreadOnly };
@@ -2351,6 +2465,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ account: state.account, folder: effFolder, uid: uid }),
       }).catch(function () { /* best-effort; UI already updated */ });
+      if (state.view === 'unread') bumpUnreadBadge(-1);
     }
     var head = document.getElementById('readerHead');
     head.innerHTML = '';
@@ -2397,7 +2512,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   }
 
   document.getElementById('unreadOnly').onchange = function () {
-    if (state.view === 'label') { this.checked = false; return; }
+    if (state.view === 'label' || state.view === 'unread') { this.checked = false; return; }
     state.unreadOnly = this.checked;
     state.offset = 0;
     if (state.view === 'todo') {
@@ -2483,6 +2598,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     btn.innerHTML = '<i class="fa-solid fa-rotate fa-spin"></i> 收信';
     loading.style.display = 'flex';
     loadFolders().then(function () {
+      if (state.view === 'unread') return loadUnreadList();
       return loadList().then(silentRefresh);
     }).then(function () {
       /* 静默完成，不弹 banner */
@@ -2502,7 +2618,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   }, 60000);
   document.getElementById('more').onclick = function () {
     state.offset += state.limit;
-    loadList();
+    if (state.view === 'unread') loadUnreadList();
+    else loadList();
   };
   document.getElementById('addLabelBtn').onclick = function () {
     openLabelModal(null);
