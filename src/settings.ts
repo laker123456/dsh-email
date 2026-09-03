@@ -29,6 +29,22 @@ export const EmailTodoSchema = z.object({
   addedAt: z.number().default(0),
 })
 
+/** One chat message in an AI assistant conversation. */
+export const EmailAiMessageSchema = z.object({
+  role: z.union([z.const('user'), z.const('assistant')]).default('user'),
+  content: z.string().default(''),
+  ts: z.number().default(0),
+})
+
+/** One AI assistant conversation. */
+export const EmailAiConversationSchema = z.object({
+  id: z.string().default(''),
+  title: z.string().default(''),
+  createdAt: z.number().default(0),
+  updatedAt: z.number().default(0),
+  messages: z.array(EmailAiMessageSchema).default([]),
+})
+
 /**
  * The settings-page shape: the single default account plus shared policy.
  * Multi-account (`accounts` map) stays YAML-only; the page edits the
@@ -55,6 +71,7 @@ export const EmailSettingsSchema = z.object({
   }),
   labels: z.array(EmailLabelSchema).default([]),
   todos: z.array(EmailTodoSchema).default([]),
+  aiConversations: z.array(EmailAiConversationSchema).default([]),
 })
 
 export interface EmailLabelCondition {
@@ -82,6 +99,20 @@ export interface EmailTodo {
   addedAt: number
 }
 
+export type EmailAiMessage = {
+  role: 'user' | 'assistant'
+  content: string
+  ts: number
+}
+
+export interface EmailAiConversation {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  messages: EmailAiMessage[]
+}
+
 export interface EmailSettingsValue {
   provider: string
   user: string
@@ -95,6 +126,7 @@ export interface EmailSettingsValue {
   smtp: { host: string; port: number; secure: boolean }
   labels: EmailLabel[]
   todos: EmailTodo[]
+  aiConversations: EmailAiConversation[]
 }
 
 /** Project the row config (cordis.patch.yml) into the settings-schema base shape. */

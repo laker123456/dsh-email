@@ -12,246 +12,246 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     }
 
+    html, body { height: 100%; }
     body {
       background-color: #f4f5f7;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
       color: #333;
+      overflow: hidden;
     }
 
     .container {
-      width: 375px;
-      height: 780px;
+      display: flex;
+      width: 100%;
+      height: 100vh;
       background: #f7f8fa;
-      border-radius: 16px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
-      position: relative;
+    }
+
+    /* 左侧会话列表 */
+    .sidebar {
+      width: 240px;
+      flex: none;
+      background: #fff;
+      border-right: 1px solid #ececf0;
       display: flex;
       flex-direction: column;
-      padding: 16px;
-      overflow: hidden;
+      transition: margin-left .2s ease;
     }
+    .sidebar.collapsed { margin-left: -240px; }
 
-    /* 顶部导航 */
-    .header {
+    .sidebar-header {
       display: flex;
+      align-items: center;
       justify-content: space-between;
-      align-items: center;
-      padding: 8px 0;
+      padding: 12px 14px;
+      border-bottom: 1px solid #f0f0f5;
     }
-
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .icon-btn {
-      font-size: 18px;
-      color: #555;
-      cursor: pointer;
-      background: none;
-      border: none;
-    }
-
-    .title {
-      font-size: 18px;
+    .sidebar-title {
+      font-size: 14px;
       font-weight: 600;
       color: #1a1a1a;
     }
-
-    .header-right {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .usage-tag {
-      background: #e8ecef;
+    .new-chat-btn {
+      background: #6c5ce7;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
       padding: 4px 10px;
-      border-radius: 12px;
-      font-size: 13px;
-      color: #666;
-    }
-
-    .usage-tag span {
-      color: #6c5ce7;
-      margin-left: 4px;
-      cursor: pointer;
-    }
-
-    .ai-logo {
-      font-weight: bold;
-      color: #6c5ce7;
-      font-size: 20px;
-    }
-
-    /* 侧边功能栏 */
-    .side-tools {
-      position: absolute;
-      right: 16px;
-      top: 60px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-      color: #888;
-      font-size: 18px;
-    }
-
-    /* 个人信息 */
-    .profile-section {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      margin-top: 6px;
-      margin-bottom: 10px;
-    }
-
-    .avatar-wrapper {
-      width: 84px;
-      height: 84px;
-      border-radius: 50%;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-    }
-
-    .avatar {
-      width: 100%;
-      height: 100%;
-      border-radius: 50%;
-      background: #fff;
-      overflow: hidden;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-    }
-
-    /* 示例头像（SVG占位） */
-    .avatar img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-    }
-
-    .profile-title {
-      font-size: 18px;
-      font-weight: bold;
-      margin-top: 12px;
-      color: #1a1a1a;
-    }
-
-    .profile-subtitle {
-      font-size: 13px;
-      color: #888;
-      margin-top: 4px;
-    }
-
-    /* 快捷指令列表 */
-    .quick-actions {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-      flex: none;
-    }
-
-    .action-card {
-      background: #ffffff;
-      padding: 12px 16px;
-      border-radius: 12px;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
-      font-size: 14px;
-      color: #333;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-
-    .action-card:hover {
-      background: #f0f0f5;
-    }
-
-    .refresh-btn {
-      text-align: center;
-      color: #666;
-      font-size: 13px;
-      margin: 28px 0 8px;
+      font-size: 12px;
       cursor: pointer;
       display: flex;
-      justify-content: center;
       align-items: center;
       gap: 4px;
     }
+    .new-chat-btn:hover { background: #5b4bc4; }
 
-    /* 底部操作区 */
-    .bottom-area {
-      display: flex;
-      flex-direction: column;
-      gap: 0;
-      margin-top: auto;
+    .conversation-list {
+      flex: 1;
+      overflow-y: auto;
     }
-
-    .tabs {
-      display: flex;
-      gap: 8px;
-    }
-
-    .tab-item {
-      background: #ffffff;
-      padding: 8px 12px;
-      border-radius: 20px;
-      font-size: 13px;
-      color: #333;
+    .conversation-item {
+      padding: 10px 14px;
+      border-bottom: 1px solid #f5f5f8;
+      cursor: pointer;
       display: flex;
       align-items: center;
-      gap: 6px;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+      gap: 8px;
+      transition: background .15s;
+    }
+    .conversation-item:hover { background: #f7f7fb; }
+    .conversation-item.active { background: #eef0ff; }
+    .conversation-item.active .conv-title { color: #6c5ce7; }
+    .conv-icon { font-size: 14px; color: #888; flex: none; }
+    .conv-main { flex: 1; min-width: 0; }
+    .conv-title {
+      font-size: 13px;
+      color: #1a1a1a;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .conv-meta {
+      font-size: 11px;
+      color: #aaa;
+      margin-top: 2px;
+    }
+    .conv-delete {
+      opacity: 0;
+      background: none;
+      border: none;
+      color: #ff4d4f;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 2px 4px;
+      flex: none;
+    }
+    .conversation-item:hover .conv-delete { opacity: 1; }
+    .empty-state {
+      padding: 28px 14px;
+      text-align: center;
+      color: #aaa;
+      font-size: 12px;
+    }
+
+    /* 右侧聊天区 */
+    .chat {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
       position: relative;
     }
-
-    .tab-item.active::before {
-      content: '';
-      position: absolute;
-      top: 6px;
-      left: 10px;
-      width: 6px;
-      height: 6px;
-      background: #ff4d4f;
-      border-radius: 50%;
-    }
-
-    .dropdown-btn {
-      background: #ffffff;
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
+    .chat-header {
       display: flex;
-      justify-content: center;
       align-items: center;
-      font-size: 12px;
-      color: #666;
+      justify-content: space-between;
+      padding: 10px 16px;
+      border-bottom: 1px solid #f0f0f5;
+      background: #fff;
+    }
+    .chat-header-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .toggle-btn {
+      background: none;
+      border: none;
+      color: #555;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .ai-logo {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      object-fit: cover;
+    }
+    .chat-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: #1a1a1a;
+    }
+    .back-btn {
+      background: none;
+      border: none;
+      color: #555;
+      cursor: pointer;
+      font-size: 14px;
     }
 
+    .quick-actions {
+      padding: 12px 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .action-card {
+      background: #fff;
+      padding: 6px 12px;
+      border-radius: 16px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+      font-size: 12px;
+      color: #333;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: background .2s;
+    }
+    .action-card:hover { background: #f0f0f5; }
+
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .msg-row {
+      display: flex;
+      gap: 10px;
+      max-width: 80%;
+    }
+    .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
+    .msg-row.assistant { align-self: flex-start; }
+    .msg-avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      flex: none;
+      object-fit: cover;
+    }
+    .msg-bubble {
+      padding: 8px 12px;
+      border-radius: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg-row.user .msg-bubble {
+      background: #6c5ce7;
+      color: #fff;
+    }
+    .msg-row.assistant .msg-bubble {
+      background: #fff;
+      color: #1a1a1a;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+    .empty-chat {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: #aaa;
+    }
+    .empty-chat .avatar-big {
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      object-fit: cover;
+    }
+
+    .input-area {
+      border-top: 1px solid #f0f0f5;
+      background: #fff;
+      padding: 10px 16px;
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+    }
     .input-box {
-      background: #ffffff;
-      border-radius: 14px;
+      flex: 1;
+      background: #f7f8fa;
+      border-radius: 12px;
       padding: 8px 12px;
       display: flex;
       flex-direction: column;
       gap: 6px;
-      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.03);
     }
-
-    .placeholder-text {
-      color: #aaa;
-      font-size: 13px;
-      line-height: 1.4;
-    }
-
     .input-textarea {
       width: 100%;
       border: none;
@@ -262,98 +262,88 @@
       line-height: 1.5;
       color: #333;
       background: transparent;
-      padding: 0;
+      max-height: 120px;
     }
-    .input-textarea::placeholder {
-      color: #aaa;
-    }
-
-    .input-toolbar {
-      display: flex;
-      justify-content: flex-end;
-      align-items: center;
-    }
-
-    .selector {
-      background: #f0f2f5;
-      padding: 6px 12px;
-      border-radius: 14px;
-      font-size: 12px;
-      color: #666;
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-
-    .input-center {
-      font-size: 13px;
-      color: #888;
-    }
-
+    .input-textarea::placeholder { color: #aaa; }
     .send-btn {
-      color: #888;
-      font-size: 16px;
+      background: #6c5ce7;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 13px;
       cursor: pointer;
+      flex: none;
     }
+    .send-btn:disabled { background: #c4c0e0; cursor: not-allowed; }
 
     .footer-tips {
       text-align: center;
       font-size: 11px;
       color: #aaa;
-      margin-top: 8px;
+      padding: 4px 0 8px;
+      background: #fff;
     }
-
-    .footer-tips span {
-      color: #888;
-      text-decoration: underline;
-    }
+    .footer-tips span { color: #888; text-decoration: underline; }
   </style>
 </head>
 <body>
 
   <div class="container">
-    <!-- 顶部导航 -->
-    <div class="header">
-      <div class="header-left">
-        <button class="icon-btn" id="backBtn">❯</button>
+    <!-- 左侧会话列表 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-title">会话列表</div>
+        <button class="new-chat-btn" id="newChatBtn" type="button">
+          <span>+</span><span>新建会话</span>
+        </button>
       </div>
-      <div class="header-right">
+      <div class="conversation-list" id="convList">
+        <div class="empty-state">暂无会话，点击右上角"新建会话"开始</div>
       </div>
-    </div>
+    </aside>
 
-    <!-- 个人信息 -->
-    <div class="profile-section">
-      <div class="avatar-wrapper">
-        <div class="avatar">
-          <img src="emailAI.png" alt="Avatar">
+    <!-- 右侧聊天区 -->
+    <main class="chat">
+      <div class="chat-header">
+        <div class="chat-header-left">
+          <button class="toggle-btn" id="toggleSidebarBtn" type="button" title="收起/展开侧栏">☰</button>
+          <img class="ai-logo" src="emailAI.png" alt="AI">
+          <div class="chat-title" id="chatTitle">邮箱AI助理</div>
+        </div>
+        <button class="back-btn" id="backBtn" type="button">关闭 ✕</button>
+      </div>
+
+      <div class="quick-actions" id="quickActions"></div>
+
+      <div class="messages" id="messages">
+        <div class="empty-chat">
+          <img class="avatar-big" src="emailAI.png" alt="AI">
+          <div>我是您的专属AI助理</div>
+          <div style="font-size:11px;color:#bbb">选择左侧会话或新建会话开始对话</div>
         </div>
       </div>
-      <div class="profile-title">邮箱AI助理</div>
-      <div class="profile-subtitle">我是您的专属AI助理</div>
-    </div>
 
-    <!-- 快捷指令列表 -->
-    <div class="quick-actions" id="quickActions">
-      <!-- 由 JS 渲染 -->
-    </div>
-    <div class="refresh-btn" id="refreshBtn">
-      <span>🔄</span> 换一批
-    </div>
-
-    <!-- 底部输入与操作 -->
-    <div class="bottom-area">
-      <div class="input-box">
-        <textarea class="input-textarea" placeholder="✦✦ 写邮件、提炼要点、搜索或询问邮件的任何问题" rows="2"></textarea>
-        <div class="input-toolbar">
-          <div class="send-btn">➔</div>
+      <div class="input-area">
+        <div class="input-box">
+          <textarea class="input-textarea" id="inputTextarea" placeholder="写邮件、提炼要点、搜索或询问邮件的任何问题" rows="2"></textarea>
         </div>
+        <button class="send-btn" id="sendBtn" type="button">发送</button>
       </div>
-    </div>
-
+      <div class="footer-tips">AI 回复为本地占位，后续将接入真实模型。<span>已知晓</span></div>
+    </main>
   </div>
 
   <script>
     (function () {
+      // iframe 加载路径: {INBOX_ROUTE}/api/asset/assistant.html
+      // 推导 BASE: 去掉末尾的 /api/asset/assistant.html
+      var BASE = window.location.pathname.replace(/\/api\/asset\/assistant\.html$/, '');
+      function api(path, opts) {
+        return fetch(BASE + path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}))
+          .then(function (r) { return r.json().catch(function () { return null; }); });
+      }
+
       var PROMPTS = [
         { icon: '✉️', text: '显示超过3天未回复的邮件' },
         { icon: '📅', text: '帮我生成最近一周的周报' },
@@ -366,58 +356,236 @@
         { icon: '⭐', text: '把最近10封重要邮件标为星标' },
         { icon: '📤', text: '汇总今天已发送的邮件' },
         { icon: '💬', text: '总结最近3封邮件的待办事项' },
-        { icon: '🔔', text: '列出所有未读邮件的发件人' },
+        { icon: '🔔', text: '列出所有未读邮件的发件人' }
       ];
       var BATCH = 5;
       var offset = 0;
 
-      var container = document.getElementById('quickActions');
-      var textarea = document.querySelector('.input-textarea');
+      var state = { conversations: [], currentId: null, sending: false };
 
-      function render() {
-        container.innerHTML = '';
+      var convListEl = document.getElementById('convList');
+      var messagesEl = document.getElementById('messages');
+      var chatTitleEl = document.getElementById('chatTitle');
+      var textarea = document.getElementById('inputTextarea');
+      var sendBtn = document.getElementById('sendBtn');
+      var quickEl = document.getElementById('quickActions');
+
+      function fmtTime(ts) {
+        if (!ts) return '';
+        var d = new Date(ts);
+        var now = new Date();
+        var sameDay = d.toDateString() === now.toDateString();
+        if (sameDay) return d.toTimeString().slice(0, 5);
+        return (d.getMonth() + 1) + '/' + d.getDate();
+      }
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+        });
+      }
+
+      function renderQuick() {
+        quickEl.innerHTML = '';
         for (var i = 0; i < BATCH; i++) {
           var p = PROMPTS[(offset + i) % PROMPTS.length];
           var card = document.createElement('div');
           card.className = 'action-card';
-          card.innerHTML = '<span>' + p.icon + '</span> ' + p.text;
+          card.innerHTML = '<span>' + p.icon + '</span><span>' + escapeHtml(p.text) + '</span>';
           (function (text) {
             card.onclick = function () {
               textarea.value = text;
               textarea.focus();
             };
           })(p.text);
-          container.appendChild(card);
+          quickEl.appendChild(card);
         }
+        var refresh = document.createElement('div');
+        refresh.className = 'action-card';
+        refresh.innerHTML = '<span>🔄</span><span>换一批</span>';
+        refresh.onclick = function () {
+          offset = (offset + BATCH) % PROMPTS.length;
+          renderQuick();
+        };
+        quickEl.appendChild(refresh);
       }
 
-      render();
-      document.getElementById('refreshBtn').onclick = function () {
-        offset = (offset + BATCH) % PROMPTS.length;
-        render();
+      function renderConvList() {
+        convListEl.innerHTML = '';
+        if (!state.conversations.length) {
+          convListEl.innerHTML = '<div class="empty-state">暂无会话，点击右上角"新建会话"开始</div>';
+          return;
+        }
+        state.conversations.forEach(function (c) {
+          var item = document.createElement('div');
+          item.className = 'conversation-item' + (c.id === state.currentId ? ' active' : '');
+          item.innerHTML =
+            '<span class="conv-icon">💬</span>' +
+            '<div class="conv-main">' +
+              '<div class="conv-title">' + escapeHtml(c.title || '新会话') + '</div>' +
+              '<div class="conv-meta">' + fmtTime(c.updatedAt || c.createdAt) + (c.messageCount ? ' · ' + c.messageCount + ' 条' : '') + '</div>' +
+            '</div>' +
+            '<button class="conv-delete" title="删除">✕</button>';
+          (function (id) {
+            item.onclick = function (e) {
+              if (e.target.classList.contains('conv-delete')) return;
+              selectConversation(id);
+            };
+            item.querySelector('.conv-delete').onclick = function (e) {
+              e.stopPropagation();
+              deleteConversation(id);
+            };
+          })(c.id);
+          convListEl.appendChild(item);
+        });
+      }
+
+      function renderMessages(conv) {
+        messagesEl.innerHTML = '';
+        if (!conv || !conv.messages || !conv.messages.length) {
+          messagesEl.innerHTML = '<div class="empty-chat">' +
+            '<img class="avatar-big" src="emailAI.png" alt="AI">' +
+            '<div>我是您的专属AI助理</div>' +
+            '<div style="font-size:11px;color:#bbb">输入消息开始对话</div>' +
+          '</div>';
+          return;
+        }
+        conv.messages.forEach(function (m) {
+          var row = document.createElement('div');
+          row.className = 'msg-row ' + m.role;
+          var avatar = m.role === 'user'
+            ? '<div class="msg-avatar" style="background:#6c5ce7;color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;">我</div>'
+            : '<img class="msg-avatar" src="emailAI.png" alt="AI">';
+          row.innerHTML = avatar + '<div class="msg-bubble">' + escapeHtml(m.content) + '</div>';
+          messagesEl.appendChild(row);
+        });
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      function selectConversation(id) {
+        state.currentId = id;
+        chatTitleEl.textContent = '加载中…';
+        return api('/api/ai/conversations/' + encodeURIComponent(id))
+          .then(function (d) {
+            if (!d || !d.ok || !d.value) {
+              chatTitleEl.textContent = '邮箱AI助理';
+              renderMessages(null);
+              renderConvList();
+              return;
+            }
+            chatTitleEl.textContent = d.value.title || '新会话';
+            renderMessages(d.value);
+            renderConvList();
+          });
+      }
+
+      function loadConversations() {
+        return api('/api/ai/conversations').then(function (d) {
+          state.conversations = (d && d.ok && d.value) ? d.value : [];
+          renderConvList();
+        });
+      }
+
+      function newConversation() {
+        return api('/api/ai/conversations', { method: 'POST', body: JSON.stringify({ title: '' }) })
+          .then(function (d) {
+            if (!d || !d.ok) { return; }
+            return loadConversations().then(function () {
+              return selectConversation(d.value.id);
+            });
+          });
+      }
+
+      function deleteConversation(id) {
+        if (!confirm('确定删除该会话？')) return;
+        api('/api/ai/conversations/' + encodeURIComponent(id), { method: 'DELETE' })
+          .then(function () {
+            if (state.currentId === id) {
+              state.currentId = null;
+              chatTitleEl.textContent = '邮箱AI助理';
+              renderMessages(null);
+            }
+            return loadConversations();
+          });
+      }
+
+      function sendMessage() {
+        if (state.sending) return;
+        var content = textarea.value.trim();
+        if (!content) { textarea.focus(); return; }
+        if (!state.currentId) {
+          // 自动新建会话后再发
+          newConversation().then(function () {
+            if (state.currentId) doSend(content);
+          });
+          return;
+        }
+        doSend(content);
+      }
+
+      function doSend(content) {
+        state.sending = true;
+        sendBtn.disabled = true;
+        textarea.value = '';
+        textarea.focus();
+        // 乐观追加用户消息
+        var optimistic = { role: 'user', content: content, ts: Date.now() };
+        appendOptimistic(optimistic);
+        api('/api/ai/conversations/' + encodeURIComponent(state.currentId) + '/messages',
+          { method: 'POST', body: JSON.stringify({ content: content }) })
+          .then(function (d) {
+            if (!d || !d.ok || !d.value) {
+              state.sending = false;
+              sendBtn.disabled = false;
+              return;
+            }
+            renderMessages(d.value);
+            state.sending = false;
+            sendBtn.disabled = false;
+            loadConversations();
+          })
+          .catch(function () {
+            state.sending = false;
+            sendBtn.disabled = false;
+          });
+      }
+
+      function appendOptimistic(msg) {
+        var existing = messagesEl.querySelector('.empty-chat');
+        if (existing) messagesEl.innerHTML = '';
+        var row = document.createElement('div');
+        row.className = 'msg-row ' + msg.role;
+        var avatar = '<div class="msg-avatar" style="background:#6c5ce7;color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;">我</div>';
+        row.innerHTML = avatar + '<div class="msg-bubble">' + escapeHtml(msg.content) + '</div>';
+        messagesEl.appendChild(row);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      sendBtn.onclick = sendMessage;
+      textarea.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+
+      document.getElementById('newChatBtn').onclick = newConversation;
+      document.getElementById('toggleSidebarBtn').onclick = function () {
+        document.getElementById('sidebar').classList.toggle('collapsed');
+      };
+      document.getElementById('backBtn').onclick = function () {
+        if (window.parent && window.parent.postMessage) {
+          window.parent.postMessage({ type: 'ai-close-panel' }, '*');
+        }
       };
 
-      var sendBtn = document.querySelector('.send-btn');
-      if (sendBtn) {
-        sendBtn.onclick = function () {
-          var v = textarea.value.trim();
-          if (!v) { textarea.focus(); return; }
-          textarea.value = '';
-          textarea.focus();
-        };
-      }
-
-      var backBtn = document.getElementById('backBtn');
-      if (backBtn) {
-        backBtn.onclick = function () {
-          if (window.parent && window.parent.postMessage) {
-            window.parent.postMessage({ type: 'ai-close-panel' }, '*');
-          }
-        };
-      }
-
+      renderQuick();
+      loadConversations().then(function () {
+        if (state.conversations.length) {
+          selectConversation(state.conversations[0].id);
+        }
+      });
     })();
-
   </script>
 </body>
 </html>

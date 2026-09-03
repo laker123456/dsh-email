@@ -6,7 +6,7 @@ import { createRequire } from 'node:module'
 import { clampInt, PROVIDER_NAMES, PROVIDER_PRESETS } from './config.js'
 import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
-import { SETTINGS_NAMESPACE, validateSettingsValue, type EmailSettingsValue } from './settings.js'
+import { SETTINGS_NAMESPACE, validateSettingsValue, type EmailAiConversation, type EmailSettingsValue } from './settings.js'
 import { isLoopbackRequest } from './web.js'
 
 // time.weoa.com uses WeBank's enterprise CA, which isn't in Node's bundled cacert.pem.
@@ -567,6 +567,161 @@ async function handleDeleteTodo(getPool: () => EmailPool, settingsScope: any, ct
   }
 }
 
+/** Generate a local placeholder reply based on the user's message text. */
+function generateAiReply(input: string): string {
+  const text = input.trim()
+  if (text === '') return '请告诉我你想做什么。'
+  if (/未读|unread/i.test(text)) return '已收到，稍后我会列出未读邮件（该能力尚未接入真实数据，此处为占位回复）。'
+  if (/周报|总结|summary/i.test(text)) return '好的，我可以基于最近邮件帮你起草周报草稿（占位回复，未接入真实 LLM）。'
+  if (/写.{0,4}邮件|起草|draft/i.test(text)) return '请提供收件人与主题，我会起草正文（占位回复，未接入真实 LLM）。'
+  if (/搜索|查找|search/i.test(text)) return '请提供关键字，我会搜索邮件（占位回复，未接入真实数据）。'
+  if (/^你好|^hi|^hello/i.test(text)) return '你好，我是邮箱 AI 助理，目前仅完成会话与本地存骨架，后续会接入真实能力。'
+  return '已收到你的消息："' + (text.length > 60 ? text.slice(0, 60) + '…' : text) + '"。（占位回复，未接入真实 LLM）'
+}
+
+/** GET /api/ai/conversations → list conversations (without message bodies). */
+function handleListAiConversations(settingsScope: any, res: any): void {
+  const value = settingsScope.get() as EmailSettingsValue
+  const list = (value.aiConversations ?? []).slice().sort((a, b) => b.updatedAt - a.updatedAt)
+    .map(c => ({ id: c.id, title: c.title, createdAt: c.createdAt, updatedAt: c.updatedAt, messageCount: (c.messages ?? []).length }))
+  responseJson(res, 200, { ok: true, value: list })
+}
+
+/** POST /api/ai/conversations → create a new conversation, return it. */
+async function handleCreateAiConversation(settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
+  let body: any = {}
+  try { body = await readJsonBody(req) } catch { /* empty body allowed */ }
+  const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 60) : ''
+  const now = Date.now()
+  const id = 'ai_' + now.toString(36) + '_' + Math.random().toString(36).slice(2, 8)
+  const conversation: EmailAiConversation = {
+    id,
+    title: title || '新会话',
+    createdAt: now,
+    updatedAt: now,
+    messages: [],
+  }
+  try {
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const list = (current.aiConversations ?? []).slice()
+      list.push(conversation)
+      return { ...current, aiConversations: list }
+    })
+    responseJson(res, 200, { ok: true, value: conversation })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '创建会话失败') } })
+  }
+}
+
+/** GET /api/ai/conversations/:id → return a single conversation with messages. */
+function handleGetAiConversation(settingsScope: any, id: string, res: any): void {
+  const value = settingsScope.get() as EmailSettingsValue
+  const conversation = (value.aiConversations ?? []).find(c => c.id === id)
+  if (!conversation) {
+    responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '会话不存在' } })
+    return
+  }
+  responseJson(res, 200, { ok: true, value: conversation })
+}
+
+/** POST /api/ai/conversations/:id/messages → append a user message and a local placeholder assistant reply. */
+async function handlePostAiMessage(settingsScope: any, ctx: any, id: string, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const content = typeof body?.content === 'string' ? body.content : ''
+  if (content.trim() === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '消息内容不能为空' } })
+    return
+  }
+  try {
+    let updated: EmailAiConversation | null = null
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const list = (current.aiConversations ?? []).slice()
+      const idx = list.findIndex(c => c.id === id)
+      if (idx < 0) throw new InboxUsageError('会话不存在')
+      const now = Date.now()
+      const userMsg = { role: 'user' as const, content, ts: now }
+      const reply = { role: 'assistant' as const, content: generateAiReply(content), ts: now + 1 }
+      const messages = (list[idx].messages ?? []).concat([userMsg, reply])
+      const title = (list[idx].messages ?? []).length === 0 && list[idx].title === '新会话'
+        ? (content.trim().slice(0, 30) || '新会话')
+        : list[idx].title
+      updated = { ...list[idx], title, messages, updatedAt: now }
+      list[idx] = updated
+      return { ...current, aiConversations: list }
+    })
+    if (!updated) {
+      responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '会话不存在' } })
+      return
+    }
+    responseJson(res, 200, { ok: true, value: updated })
+  } catch (error) {
+    if (error instanceof InboxUsageError) {
+      responseJson(res, 404, { ok: false, error: { code: 'not-found', message: messageOf(error, '会话不存在') } })
+      return
+    }
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '发送失败') } })
+  }
+}
+
+/** PATCH /api/ai/conversations/:id → rename a conversation. */
+async function handleRenameAiConversation(settingsScope: any, ctx: any, id: string, req: any, res: any): Promise<void> {
+  let body: any
+  try { body = await readJsonBody(req) } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const title = typeof body?.title === 'string' ? body.title.trim().slice(0, 60) : ''
+  if (title === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '标题不能为空' } })
+    return
+  }
+  try {
+    let found = false
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const list = (current.aiConversations ?? []).slice()
+      const idx = list.findIndex(c => c.id === id)
+      if (idx < 0) return current
+      list[idx] = { ...list[idx], title, updatedAt: Date.now() }
+      found = true
+      return { ...current, aiConversations: list }
+    })
+    if (!found) {
+      responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '会话不存在' } })
+      return
+    }
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '重命名失败') } })
+  }
+}
+
+/** DELETE /api/ai/conversations/:id → remove a conversation. */
+async function handleDeleteAiConversation(settingsScope: any, ctx: any, id: string, res: any): Promise<void> {
+  try {
+    let found = false
+    await mutateSettings(settingsScope, ctx, (current) => {
+      const list = (current.aiConversations ?? []).filter(c => c.id !== id)
+      if (list.length !== (current.aiConversations ?? []).length) found = true
+      return { ...current, aiConversations: list }
+    })
+    if (!found) {
+      responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '会话不存在' } })
+      return
+    }
+    responseJson(res, 200, { ok: true })
+  } catch (error) {
+    const conflict = (error as any)?.code === 'SETTINGS_CONFLICT'
+    responseJson(res, conflict ? 409 : 400, { ok: false, error: { code: conflict ? 'conflict' : 'bad-request', message: messageOf(error, '删除失败') } })
+  }
+}
+
 async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: any, req: any, res: any): Promise<void> {
   // Localhost-only, same policy as the settings route: full message content
   // must never leak to the LAN when the webserver binds 0.0.0.0.
@@ -639,6 +794,34 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
   }
   if (req.method === 'GET' && sub === '/api/dir-search') {
     await handleDirSearch(req, res)
+    return
+  }
+  if (req.method === 'GET' && sub === '/api/ai/conversations') {
+    handleListAiConversations(settingsScope, res)
+    return
+  }
+  if (req.method === 'POST' && sub === '/api/ai/conversations') {
+    await handleCreateAiConversation(settingsScope, ctx, req, res)
+    return
+  }
+  if (req.method === 'GET' && sub.startsWith('/api/ai/conversations/')) {
+    const id = decodeURIComponent(sub.slice('/api/ai/conversations/'.length))
+    handleGetAiConversation(settingsScope, id, res)
+    return
+  }
+  if (req.method === 'POST' && sub.startsWith('/api/ai/conversations/') && sub.endsWith('/messages')) {
+    const id = decodeURIComponent(sub.slice('/api/ai/conversations/'.length, -'/messages'.length))
+    await handlePostAiMessage(settingsScope, ctx, id, req, res)
+    return
+  }
+  if (req.method === 'PATCH' && sub.startsWith('/api/ai/conversations/')) {
+    const id = decodeURIComponent(sub.slice('/api/ai/conversations/'.length))
+    await handleRenameAiConversation(settingsScope, ctx, id, req, res)
+    return
+  }
+  if (req.method === 'DELETE' && sub.startsWith('/api/ai/conversations/')) {
+    const id = decodeURIComponent(sub.slice('/api/ai/conversations/'.length))
+    await handleDeleteAiConversation(settingsScope, ctx, id, res)
     return
   }
 
@@ -1276,7 +1459,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     <input id="searchInput" type="text" placeholder="搜索邮件主题/发件人/收件人/正文" autocomplete="off">
   </div>
   <div class="user-area">
-    <button id="aiAssistantBtn" type="button" title="AI 助理" style="border:none;background:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:6px;font-size:13px;color:#333">
+    <button id="aiAssistantBtn" type="button" title="AI 助理" style="border:none;background:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:6px;font-size:13px;color:#333;display:none">
       <img src="${INBOX_ROUTE}/api/asset/emailAI.png" alt="AI助理" style="width:24px;height:24px;border-radius:50%">
       <span>AI助理</span>
     </button>
