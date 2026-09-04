@@ -2130,6 +2130,36 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (!badge || !badge.dataset.total) return;
     setUnreadBadge(Math.max(0, parseInt(badge.dataset.total, 10) + delta));
   }
+  function bumpFolderBadge(folderPath, delta) {
+    if (!folderPath) return;
+    var nav = document.getElementById('folders');
+    if (!nav) return;
+    var btn = null;
+    for (var i = 0; i < nav.children.length; i++) {
+      var n = nav.children[i];
+      if (n && n.dataset && n.dataset.path === folderPath) { btn = n; break; }
+    }
+    if (!btn) return;
+    var badge = null;
+    for (var j = 0; j < btn.children.length; j++) {
+      if (btn.children[j].classList && btn.children[j].classList.contains('count-badge')) { badge = btn.children[j]; break; }
+    }
+    if (!badge) {
+      if (delta < 0) return;
+      badge = document.createElement('span');
+      badge.className = 'count-badge';
+      badge.textContent = '0';
+      btn.appendChild(badge);
+    }
+    var next = Math.max(0, (parseInt(badge.textContent, 10) || 0) + delta);
+    if (next > 0) {
+      badge.textContent = next;
+      badge.title = '未读 ' + next;
+      badge.style.display = '';
+    } else {
+      badge.remove();
+    }
+  }
   function openUnreadView() {
     state.labelId = '';
     state.offset = 0;
@@ -2648,7 +2678,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ account: state.account, folder: effFolder, uid: uid }),
       }).catch(function () { /* best-effort; UI already updated */ });
-      if (state.view === 'unread') bumpUnreadBadge(-1);
+      bumpUnreadBadge(-1);
+      bumpFolderBadge(effFolder, -1);
     }
     var head = document.getElementById('readerHead');
     head.innerHTML = '';
