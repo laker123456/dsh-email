@@ -103,10 +103,25 @@ function toIso(date: Date | null | undefined): string {
   return date instanceof Date ? date.toISOString() : ''
 }
 
+const SHANGHAI_FMT = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false,
+})
+
+function toShanghaiLocal(date: Date | null | undefined): string {
+  if (!(date instanceof Date)) return ''
+  const parts = SHANGHAI_FMT.formatToParts(date)
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? ''
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`
+}
+
 function listedFrom(envelope: any, size: number | undefined, hasAttachments: boolean): ListedMessage {
   return {
     uid: envelope.uid as number,
     date: toIso(envelope.envelope?.date),
+    dateLocal: toShanghaiLocal(envelope.envelope?.date),
     from: flattenAddresses(envelope.envelope?.from),
     cc: flattenAddresses(envelope.envelope?.cc),
     subject: envelope.envelope?.subject ?? '',

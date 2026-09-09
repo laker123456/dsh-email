@@ -7,8 +7,12 @@ export interface AddressEntry {
 /** One listed message: everything cheap to fetch without the body. */
 export interface ListedMessage {
   uid: number
-  /** ISO 8601 string, or '' when unknown. */
+  /** ISO 8601 string, or '' when unknown. Kept as UTC so MIME Date headers
+   *  (e.g. on forward) round-trip through `new Date(...).toUTCString()`. */
   date: string
+  /** Same instant as `date`, formatted as 'YYYY-MM-DD HH:MM:SS' in Asia/Shanghai.
+   *  Use this for display in the inbox UI and for the LLM-facing tool output. */
+  dateLocal?: string
   from: AddressEntry[]
   /** CC recipients from the envelope; used to auto-fill CC on reply/forward. */
   cc?: AddressEntry[]
@@ -32,7 +36,10 @@ export interface EmailAttachmentMeta {
 
 /** One fully read message body. */
 export interface ReadMessageBody {
+  /** ISO 8601 string in UTC, or '' when unknown. */
   date: string
+  /** Same instant as `date`, formatted as 'YYYY-MM-DD HH:MM:SS' in Asia/Shanghai. */
+  dateLocal?: string
   from: AddressEntry[]
   to: AddressEntry[]
   cc: AddressEntry[]

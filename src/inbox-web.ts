@@ -1842,10 +1842,11 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
     return n + ' B';
   }
-  function fmtDate(iso) {
+  function fmtDate(iso, local) {
+    if (local) return local;
     if (!iso) return '';
     var d = new Date(iso);
-    return isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false });
+    return isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' });
   }
   function folderIcon(f) {
     var s = f.specialUse || '';
@@ -2193,7 +2194,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       from.className = 'from';
       from.textContent = t.from || '(未知)';
       var date = document.createElement('span');
-      date.textContent = fmtDate(t.date);
+      date.textContent = fmtDate(t.date, t.dateLocal);
       meta.appendChild(from);
       meta.appendChild(date);
       li.appendChild(meta);
@@ -2540,7 +2541,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       return p.name || p.address;
     }).filter(Boolean).join(', ') || '(未知)';
     var date = document.createElement('span');
-    date.textContent = fmtDate(m.date);
+    date.textContent = fmtDate(m.date, m.dateLocal);
     meta.appendChild(from);
     meta.appendChild(date);
     li.appendChild(meta);
@@ -2878,7 +2879,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         var p = parseAddr(a);
         return p.name ? p.name + ' <' + p.address + '>' : p.address;
       }).join(', ');
-      document.getElementById('readerMeta').textContent = fmtDate(v.date);
+      document.getElementById('readerMeta').textContent = fmtDate(v.date, v.dateLocal);
       head.innerHTML =
         '<h2>' + esc(v.subject || '(无主题)') + '</h2>' +
         '<div class="meta-row">' +

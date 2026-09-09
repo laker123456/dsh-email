@@ -1,6 +1,17 @@
 import { simpleParser } from 'mailparser'
 import type { AddressEntry, EmailAttachmentMeta, ReadMessageBody } from './types.js'
 
+const SHANGHAI_DATE_FMT = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false,
+})
+
+function toShanghaiLocal(date: Date | null | undefined): string {
+  return date instanceof Date ? SHANGHAI_DATE_FMT.format(date) : ''
+}
+
 export function flattenAddresses(input: unknown): AddressEntry[] {
   if (input === null || input === undefined) return []
   const list = Array.isArray(input) ? input : (input as { value?: unknown }).value
@@ -77,6 +88,7 @@ export async function parseRawMessage(source: Buffer, maxBodyChars: number): Pro
   }))
   return {
     date: parsed.date instanceof Date ? parsed.date.toISOString() : '',
+    dateLocal: toShanghaiLocal(parsed.date),
     from: flattenAddresses(parsed.from),
     to: flattenAddresses(parsed.to),
     cc: flattenAddresses(parsed.cc),
