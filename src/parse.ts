@@ -65,6 +65,10 @@ export async function parseRawMessage(source: Buffer, maxBodyChars: number): Pro
     text = stripHtml(parsed.html)
   }
   const limited = truncateText(text, maxBodyChars)
+  const rawHtml = typeof parsed.html === 'string' ? parsed.html : ''
+  const htmlLimited = rawHtml.length > maxBodyChars
+    ? { text: rawHtml.slice(0, maxBodyChars), truncated: true }
+    : { text: rawHtml, truncated: false }
   const attachments: EmailAttachmentMeta[] = (parsed.attachments ?? []).map((att, index) => ({
     filename: att.filename ?? '(unnamed)',
     contentType: att.contentType,
@@ -78,8 +82,9 @@ export async function parseRawMessage(source: Buffer, maxBodyChars: number): Pro
     cc: flattenAddresses(parsed.cc),
     subject: parsed.subject ?? '',
     text: limited.text,
+    html: htmlLimited.text,
     attachments,
-    truncated: limited.truncated,
+    truncated: limited.truncated || htmlLimited.truncated,
   }
 }
 

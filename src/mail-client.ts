@@ -108,6 +108,7 @@ function listedFrom(envelope: any, size: number | undefined, hasAttachments: boo
     uid: envelope.uid as number,
     date: toIso(envelope.envelope?.date),
     from: flattenAddresses(envelope.envelope?.from),
+    cc: flattenAddresses(envelope.envelope?.cc),
     subject: envelope.envelope?.subject ?? '',
     seen: envelope.flags?.has('\\Seen') === true,
     flagged: envelope.flags?.has('\\Flagged') === true,
@@ -176,7 +177,7 @@ export class EmailPool {
   }
 
   private createImap(cfg: ResolvedEmailConfig): ImapFlow {
-    return new ImapFlow({
+    const client = new ImapFlow({
       host: cfg.imap.host,
       port: cfg.imap.port,
       secure: cfg.imap.secure,
@@ -187,6 +188,14 @@ export class EmailPool {
       socketTimeout: cfg.imap.socketTimeoutMs ?? 60000,
       tls: tlsOptionsFor(cfg),
     })
+    // ImapFlow emits 'error' on socket timeouts / TLS handshake failures etc.
+    // Without a listener, the event bubbles to Node's process-level
+    // uncaughtException and kills the whole dev server (see 2026-09-08
+    // webank IMAP greeting socket timeout incident). Business-layer callers
+    // already surface the same error via try/catch in `imapRun`, so this is
+    // strictly a safety net to keep the event from escaping the process.
+    client.on('error', () => { /* noop */ })
+    return client
   }
 
   private async imapRun<T>(name: string, cfg: ResolvedEmailConfig, folder: string | null, run: (client: ImapFlow) => Promise<T>): Promise<T> {
@@ -623,6 +632,32 @@ export class EmailPool {
       try { await client.logout() } catch { /* ignore */ }
     }
     this.invalidateMailbox(name, folderName)
+    this.invalidateFolderCache(name)
+  }
+
+  /** Mark multiple messages as seen (\\Seen) in a single IMAP session.
+   *  Loop `messageFlagsAdd` per uid; one connect/mailboxOpen amortizes the
+   *  handshake cost vs. calling `markSeen` N times. Empty `uids` is a noop. */
+  async markSeenBatch(accountName: string | undefined, folder: string, uids: number[]): Promise<void> {
+    if (!Array.isArray(uids) || uids.length === 0) return
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    const client = this.createImap(cfg)
+    try {
+      await client.connect()
+      await client.mailboxOpen(folderName, { readOnly: false })
+      for (const uid of uids) {
+        if (!Number.isInteger(uid) || uid <= 0) continue
+        await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true })
+      }
+    } catch (error) {
+      throw this.normalizeImapError(error, folderName)
+    } finally {
+      try { await client.logout() } catch { /* ignore */ }
+    }
+    this.invalidateMailbox(name, folderName)
+    this.invalidateFolderCache(name)
   }
 
   /** Toggle \\Seen flag on/off via a read-write connection. */
@@ -642,6 +677,7 @@ export class EmailPool {
       try { await client.logout() } catch { /* ignore */ }
     }
     this.invalidateMailbox(name, folderName)
+    this.invalidateFolderCache(name)
   }
 
   /** Move a message to another folder (used for delete-to-trash). */
@@ -659,6 +695,8 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
+    this.invalidateMailbox(name, folderName)
+    this.invalidateFolderCache(name)
   }
 
   /** Toggle \\Flagged (pinned/starred) via a read-write connection. */
@@ -678,6 +716,7 @@ export class EmailPool {
       try { await client.logout() } catch { /* ignore */ }
     }
     this.invalidateMailbox(name, folderName)
+    this.invalidateFolderCache(name)
   }
 
   /**
@@ -722,7 +761,7 @@ export class EmailPool {
       }
       return { account: name, folders }
     })
-    this.folderCache.set(cacheKey, { value, expireAt: now + 24 * 60 * 60 * 1000 })
+    this.folderCache.set(cacheKey, { value, expireAt: now + 60 * 1000 })
     return value
   }
 

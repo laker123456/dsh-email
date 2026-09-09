@@ -10,6 +10,8 @@ export interface ListedMessage {
   /** ISO 8601 string, or '' when unknown. */
   date: string
   from: AddressEntry[]
+  /** CC recipients from the envelope; used to auto-fill CC on reply/forward. */
+  cc?: AddressEntry[]
   subject: string
   seen: boolean
   flagged: boolean
@@ -37,6 +39,8 @@ export interface ReadMessageBody {
   subject: string
   /** Plain-text body; HTML mail is converted. Truncated at maxBodyChars. */
   text: string
+  /** Original HTML body for HTML-capable callers (e.g. forward). Empty when the source has no HTML part. Truncated at maxBodyChars. */
+  html: string
   attachments: EmailAttachmentMeta[]
   truncated: boolean
 }

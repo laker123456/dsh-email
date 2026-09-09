@@ -2,19 +2,16 @@ import { mkdir, writeFile, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
-import { createRequire } from 'node:module'
 import { clampInt, PROVIDER_NAMES, PROVIDER_PRESETS } from './config.js'
 import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
 import { SETTINGS_NAMESPACE, validateSettingsValue, type EmailAiConversation, type EmailSettingsValue } from './settings.js'
 import { isLoopbackRequest } from './web.js'
 
-// time.weoa.com uses WeBank's enterprise CA, which isn't in Node's bundled cacert.pem.
-// undici's Agent scopes the TLS downgrade to this dispatcher instead of setting
-// NODE_TLS_REJECT_UNAUTHORIZED=0 process-wide. Node 18+ bundles undici.
-const nodeRequire = createRequire(import.meta.url)
-const undici: any = nodeRequire('undici')
-const intranetDispatcher = new undici.Agent({ connect: { rejectUnauthorized: false } })
+// time.weoa.com uses WeBank's enterprise CA, which isn't in Node's bundled
+// cacert.pem. We rely on the host Electron app (weban-desktop) setting
+// NODE_TLS_REJECT_UNAUTHORIZED=0 for its embedded dsh process; per-source
+// undici dispatcher triggers "invalid onRequestStart method" against undici 8.
 
 export const INBOX_ROUTE = '/_dsh/dsh-email/inbox'
 
@@ -110,6 +107,44 @@ async function handleMarkSeen(getPool: () => EmailPool, req: any, res: any): Pro
     responseJson(res, 200, { ok: true })
   } catch (error) {
     const message = messageOf(error, '标记已读失败')
+    const bad = error instanceof MailError || message.startsWith('dsh-email')
+    responseJson(res, bad ? 400 : 500, { ok: false, error: { code: bad ? 'bad-request' : 'internal', message } })
+  }
+}
+
+/** POST /api/mark-seen-batch: flip \\Seen on multiple messages in one IMAP session.
+ *  body = { account?, folder, uids: number[] }. Empty uids is a noop 200. */
+async function handleMarkSeenBatch(getPool: () => EmailPool, req: any, res: any): Promise<void> {
+  let body: any
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    responseJson(res, 400, { ok: false, error: { code: 'invalid-request', message: messageOf(error, 'invalid request body') } })
+    return
+  }
+  const account = typeof body?.account === 'string' && body.account !== '' ? body.account : undefined
+  const folder = typeof body?.folder === 'string' ? body.folder : ''
+  const raw = body?.uids
+  const uids: number[] | null = Array.isArray(raw)
+    ? raw.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n > 0)
+    : null
+  if (folder === '') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'folder 不能为空' } })
+    return
+  }
+  if (uids === null) {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'uids 必须是数组' } })
+    return
+  }
+  if (uids.length === 0) {
+    responseJson(res, 200, { ok: true, value: { count: 0 } })
+    return
+  }
+  try {
+    await getPool().markSeenBatch(account, folder, uids)
+    responseJson(res, 200, { ok: true, value: { count: uids.length } })
+  } catch (error) {
+    const message = messageOf(error, '批量标记已读失败')
     const bad = error instanceof MailError || message.startsWith('dsh-email')
     responseJson(res, bad ? 400 : 500, { ok: false, error: { code: bad ? 'bad-request' : 'internal', message } })
   }
@@ -443,7 +478,6 @@ async function handleDirSearch(req: any, res: any): Promise<void> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': auth.key!, 'OPERATOR': auth.username! },
       body: JSON.stringify({ queryKey: q }),
-      dispatcher: intranetDispatcher,
     })
     const j = await r.json() as any
     if (j?.CODE !== '0') {
@@ -744,6 +778,10 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
     await handleMarkSeen(getPool, req, res)
     return
   }
+  if (req.method === 'POST' && sub === '/api/mark-seen-batch') {
+    await handleMarkSeenBatch(getPool, req, res)
+    return
+  }
   if (req.method === 'POST' && sub === '/api/toggle-seen') {
     await handleToggleSeen(getPool, req, res)
     return
@@ -1011,24 +1049,24 @@ function inboxPageHtml(): string {
 html, body { height: 100%; }
 body {
   font: 13px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-  color: #333; background: #f4f6f9; display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  color: #333; background: #efe1c8; display: flex; flex-direction: column; height: 100vh; overflow: hidden;
 }
 button, select, input { font: inherit; }
 
 /* 顶栏 */
 .header {
-  height: 52px; background: #f0f3f8; border-bottom: 1px solid #e1e6ed;
+  height: 52px; background: linear-gradient(to right, #fdf5e2 210px, #fff 210px); border-bottom: 1px solid #e1e6ed;
   display: flex; align-items: center; justify-content: space-between; padding: 0 16px; flex-shrink: 0;
+  position: relative;
 }
-.logo-area { display: flex; align-items: center; width: 210px; }
-.logo-title { font-size: 20px; font-weight: bold; color: #1262d6; display: flex; align-items: center; gap: 6px; }
-.logo-title .logo-sub { font-size: 10px; color: #1262d6; font-weight: normal; line-height: 1.1; }
-.search-bar { flex: 1; max-width: 480px; position: relative; margin: 0 16px; }
+.logo-title { font-size: 20px; font-weight: bold; color: #e0a37a; display: flex; align-items: center; gap: 6px; }
+.logo-title .logo-sub { font-size: 10px; color: #e0a37a; font-weight: normal; line-height: 1.1; }
+.search-bar { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 100%; max-width: 360px; }
 .search-bar input {
-  width: 100%; height: 32px; background: #e2e7ef; border: 1px solid transparent;
+  width: 100%; height: 32px; background: #fff; border: 1px solid transparent;
   border-radius: 16px; padding: 0 16px 0 36px; font-size: 13px; outline: none; color: #333;
 }
-.search-bar input:focus { background: #fff; border-color: #0084ff; }
+.search-bar input:focus { background: #fff; border-color: #d97a4e; }
 .search-bar i { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: #8a97a8; }
 .user-area { display: flex; align-items: center; gap: 12px; font-size: 12px; color: #555; }
 
@@ -1037,25 +1075,24 @@ button, select, input { font: inherit; }
 
 /* 左侧栏 */
 .sidebar {
-  width: 210px; background: #ebf0f5; border-right: 1px solid #dce2e9;
+  width: 210px; background: #fdf5e2; border-right: 1px solid #eee3cd;
   display: flex; flex-direction: column; padding: 12px 8px; overflow-y: auto; flex-shrink: 0;
 }
-.sidebar-action-row {
-  display: flex; gap: 8px; margin-bottom: 12px;
-}
-.sidebar-action-row .btn-compose { flex: 1 1 0; margin-bottom: 0; }
+.header-actions { display: flex; gap: 8px; flex-shrink: 0; width: 178px; }
+.header-actions .btn-fetch,
+.header-actions .btn-compose { flex: 1 1 0; min-width: 0; }
 .btn-fetch {
-  flex: 1 1 0; background: #fff; color: #2b80ff; border: 1px solid #2b80ff;
+  flex: 1 1 0; background: #fff; color: #d97a4e; border: 1px solid #d97a4e;
   border-radius: 6px; padding: 8px 12px; font-size: 13px; font-weight: 500;
   display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer;
-  box-shadow: 0 2px 4px rgba(0,86,224,0.08);
+  box-shadow: 0 2px 4px rgba(217,122,78,0.1);
 }
-.btn-fetch:hover { background: #f0f6ff; }
+.btn-fetch:hover { background: #f4e3ca; }
 .btn-compose {
-  background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; border: none;
+  background: linear-gradient(135deg, #d97a4e, #e0a37a); color: #fff; border: none;
   border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 500;
   display: flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer;
-  box-shadow: 0 2px 4px rgba(0,86,224,0.2);
+  box-shadow: 0 2px 4px rgba(255,122,69,0.2);
 }
 .btn-compose:hover { filter: brightness(1.05); }
 .menu-group { margin-bottom: 8px; }
@@ -1065,15 +1102,15 @@ button, select, input { font: inherit; }
   padding: 5px 12px; border-radius: 6px; color: #333; cursor: pointer;
   font-size: 13px; border: none; background: none; width: 100%; text-align: left;
 }
-.menu-item:hover { background: #dedede; }
-.menu-item.active { background: #dce7f5; color: #0056e0; font-weight: 600; }
+.menu-item:hover { background: #fbf1de; }
+.menu-item.active { background: #fdf5e2; color: #e0a37a; font-weight: 600; }
 .menu-item-left { display: flex; align-items: center; gap: 10px; overflow: hidden; }
 .menu-item-left i { width: 16px; text-align: center; color: #666; flex-shrink: 0; }
-.menu-item.active .menu-item-left i { color: #0056e0; }
+.menu-item.active .menu-item-left i { color: #e0a37a; }
 .menu-item-left span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.count-badge { font-size: 11px; color: #0056e0; font-weight: bold; flex-shrink: 0; }
-.folder-chip { font-size: 11px; color: #66788f; background: #eef2f7; border-radius: 4px; padding: 0 6px; flex-shrink: 0; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.unread-dot { width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; flex-shrink: 0; display: inline-block; }
+.count-badge { font-size: 11px; color: #e0a37a; font-weight: bold; flex-shrink: 0; }
+.folder-chip { font-size: 11px; color: #66788f; background: #fdf5e2; border-radius: 4px; padding: 0 6px; flex-shrink: 0; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.unread-dot { width: 6px; height: 6px; background: #d97a4e; border-radius: 50%; flex-shrink: 0; display: inline-block; }
 .sidebar-footer { margin-top: auto; padding: 8px 12px; font-size: 11px; color: #8a97a8; }
 
 /* 中间邮件列表 */
@@ -1092,11 +1129,11 @@ button, select, input { font: inherit; }
 }
 .list-toolbar button:hover { background: #e6e9f0; }
 #messages { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
-#messages li { padding: 10px 14px; border-bottom: 1px solid #eef1f4; cursor: pointer; }
-#messages li:hover { background: #f6f8fa; }
-#messages li.active { background: #dce7f5; }
-#messages li.unread .subject { font-weight: 700; color: #0056e0; }
-#messages li.unread .subject::before { content: ""; display: inline-block; width: 6px; height: 6px; background: #ff4d4f; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+#messages li { padding: 10px 14px; border-bottom: 1px solid #dec89f; cursor: pointer; }
+#messages li:hover { background: #f3e3cd; }
+#messages li.active { background: #fdf5e2; }
+#messages li.unread .subject { font-weight: 700; color: #1a1a1a; }
+#messages li.unread .subject::before { content: ""; display: inline-block; width: 6px; height: 6px; background: #d97a4e; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 #messages li.hint { color: #8a97a8; cursor: default; text-align: center; }
 #messages .subject { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; }
 #messages .meta { color: #8a97a8; font-size: 11px; display: flex; gap: 8px; margin-top: 3px; }
@@ -1125,7 +1162,7 @@ button, select, input { font: inherit; }
 #readerHead h2 { font-size: 16px; font-weight: bold; color: #111; margin-bottom: 10px; }
 #readerHead .meta-row { display: flex; align-items: flex-start; gap: 12px; }
 #readerHead .avatar-tag {
-  width: 28px; height: 28px; background: #ff6b6b; color: #fff; border-radius: 4px;
+  width: 28px; height: 28px; background: #d97a4e; color: #fff; border-radius: 4px;
   display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: bold; flex-shrink: 0;
 }
 #readerHead .meta-info { flex: 1; font-size: 12px; line-height: 1.7; }
@@ -1137,7 +1174,7 @@ button, select, input { font: inherit; }
 #placeholder { color: #8a97a8; padding: 40px; text-align: center; }
 #frame { border: none; width: 100%; background: #fff; min-height: 200px; flex-shrink: 0; }
 #attach { padding: 10px 24px; background: #fff; border-top: 1px solid #f0f0f0; font-size: 12px; flex-shrink: 0; }
-#attach a { color: #1262d6; text-decoration: none; margin-right: 14px; display: inline-flex; align-items: center; gap: 4px; }
+#attach a { color: #e0a37a; text-decoration: none; margin-right: 14px; display: inline-flex; align-items: center; gap: 4px; }
 #attach a:hover { text-decoration: underline; }
 
 /* banner：页面中央浮层提示 */
@@ -1152,24 +1189,24 @@ button, select, input { font: inherit; }
 /* 登录视图 */
 #loginView {
   flex: 1; display: none; align-items: center; justify-content: center;
-  background: #f4f6f9; padding: 24px;
+  background: #efe1c8; padding: 24px;
 }
 #loginView.active { display: flex; }
 #loginForm {
   width: 100%; max-width: 360px; background: #fff; border: 1px solid #e1e6ed;
   border-radius: 8px; padding: 32px 28px; box-shadow: 0 2px 10px rgba(0,0,0,0.04);
 }
-#loginForm h2 { margin: 0 0 8px; font-size: 18px; color: #1262d6; }
+#loginForm h2 { margin: 0 0 8px; font-size: 18px; color: #e0a37a; }
 #loginForm .subtitle { font-size: 12px; color: #8a97a8; margin-bottom: 20px; }
 #loginForm label { display: block; margin: 12px 0 4px; font-size: 13px; color: #555; }
 #loginForm input {
   width: 100%; height: 34px; padding: 0 10px; border: 1px solid #d0d7de;
   border-radius: 6px; font: inherit; box-sizing: border-box; outline: none;
 }
-#loginForm input:focus { border-color: #0084ff; }
+#loginForm input:focus { border-color: #d97a4e; }
 #loginForm button {
   margin-top: 20px; width: 100%; height: 36px; border: none; border-radius: 6px;
-  background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; cursor: pointer;
+  background: linear-gradient(135deg, #d97a4e, #e0a37a); color: #fff; cursor: pointer;
   font: inherit; font-weight: 500;
 }
 #loginForm button:hover:not(:disabled) { filter: brightness(1.05); }
@@ -1180,7 +1217,7 @@ button, select, input { font: inherit; }
 .ai-panel {
   position: fixed; top: 0; right: 0; bottom: 0;
   width: 375px; display: flex; flex-direction: column;
-  border-left: 1px solid #dce2e9; background: #f7f8fa; flex-shrink: 0; min-height: 0;
+  border-left: 1px solid #eee3cd; background: #efe1c8; flex-shrink: 0; min-height: 0;
   z-index: 20; box-shadow: -4px 0 12px rgba(0,0,0,0.08);
 }
 .ai-panel-header {
@@ -1193,7 +1230,7 @@ button, select, input { font: inherit; }
   width: 24px; height: 24px; border-radius: 4px; display: flex; align-items: center; justify-content: center;
 }
 .ai-panel-close:hover { background: #eef1f5; color: #333; }
-#aiFrame { flex: 1; border: none; width: 100%; min-height: 0; background: #f7f8fa; }
+#aiFrame { flex: 1; border: none; width: 100%; min-height: 0; background: #efe1c8; }
 
 /* 智能分类 */
 .plus-btn {
@@ -1201,7 +1238,7 @@ button, select, input { font: inherit; }
   width: 18px; height: 18px; border-radius: 4px; display: inline-flex;
   align-items: center; justify-content: center; font-size: 11px;
 }
-.plus-btn:hover { background: #dce2e9; color: #0056e0; }
+.plus-btn:hover { background: #eee3cd; color: #e0a37a; }
 .menu-title { display: flex; align-items: center; justify-content: space-between; }
 .title-toggle {
   display: flex; align-items: center; gap: 6px; cursor: pointer;
@@ -1210,7 +1247,7 @@ button, select, input { font: inherit; }
 .title-toggle i { font-size: 10px; transition: transform .15s; width: 10px; }
 #labelsGroup.expanded .title-toggle i { transform: rotate(90deg); }
 .label-dot {
-  width: 8px; height: 8px; border-radius: 50%; background: #0056e0;
+  width: 8px; height: 8px; border-radius: 50%; background: #e0a37a;
   flex-shrink: 0; display: inline-block;
 }
 .menu-item .label-delete {
@@ -1234,7 +1271,7 @@ dialog#labelModal {
 dialog#composeModal {
   border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
   width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh;
-  border-radius: 0; overflow: hidden;
+  border-radius: 0; overflow: auto;
   margin: 0; box-shadow: 0 4px 24px rgba(0,0,0,0.16); color: #333;
   display: none;
 }
@@ -1309,7 +1346,7 @@ dialog#composeModal .tb-item {
   align-items: center; gap: 2px; color: #555; user-select: none;
 }
 dialog#composeModal .tb-item:hover { background: #ececec; }
-dialog#composeModal .tb-item.active { background: #dce7f5; color: #0056e0; }
+dialog#composeModal .tb-item.active { background: #fdf5e2; color: #e0a37a; }
 dialog#composeModal .tb-select {
   border: 1px solid #d9d9d9; border-radius: 2px; padding: 2px 4px; background: #fff; font-size: 12px; outline: none;
 }
@@ -1320,7 +1357,7 @@ dialog#composeModal .tool-btn {
   border: 1px solid transparent; transition: background .12s, border-color .12s;
 }
 dialog#composeModal .tool-btn:hover { background: #eef1f5; border-color: #dde2e8; }
-dialog#composeModal .tool-btn.active { background: #dce7f5; color: #0056e0; border-color: #b8d4f5; }
+dialog#composeModal .tool-btn.active { background: #fdf5e2; color: #e0a37a; border-color: #eebd8d; }
 dialog#composeModal .tool-btn .fa-solid { font-size: 13px; }
 dialog#composeModal .tool-select {
   height: 26px; border: 1px solid #d0d0d0; background: #fff;
@@ -1353,10 +1390,12 @@ dialog#composeModal .palette-row .swatch-cell:hover { transform: scale(1.15); bo
 dialog#composeModal .palette-custom { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid #eee; }
 dialog#composeModal .palette-custom input[type=color] { width: 24px; height: 24px; padding: 0; border: 1px solid #d0d0d0; border-radius: 3px; cursor: pointer; background: #fff; }
 dialog#composeModal .editor-content {
-  flex: 1; min-height: 400px; padding: 16px 20px; outline: none; overflow-y: auto;
+  flex: none; min-height: 400px; padding: 16px 20px; outline: none; overflow: visible;
   font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: #222; background: #fff;
 }
+dialog#composeModal .editor-content img { max-width: 100%; height: auto; }
+dialog#composeModal .editor-content table { max-width: 100%; }
 dialog#composeModal .editor-content:empty::before {
   content: attr(data-placeholder); color: #b0b6bf; pointer-events: none;
 }
@@ -1383,13 +1422,13 @@ dialog#composeModal #composeMsg { color: #cf222e; font-size: 12px; min-height: 1
 }
 dialog#labelModal::backdrop { background: rgba(0,0,0,0.3); }
 dialog#labelModal form { padding: 20px 24px; }
-dialog#labelModal h3 { margin: 0 0 12px; font-size: 16px; color: #1262d6; }
+dialog#labelModal h3 { margin: 0 0 12px; font-size: 16px; color: #e0a37a; }
 dialog#labelModal label { display: block; margin: 10px 0 4px; font-size: 13px; color: #555; }
 dialog#labelModal input[type=text] {
   width: 100%; height: 32px; padding: 0 10px; border: 1px solid #d0d7de;
   border-radius: 6px; font: inherit; box-sizing: border-box; outline: none;
 }
-dialog#labelModal input[type=text]:focus { border-color: #0084ff; }
+dialog#labelModal input[type=text]:focus { border-color: #d97a4e; }
 dialog#labelModal .color-row { display: flex; gap: 6px; margin-top: 4px; }
 dialog#labelModal .color-swatch {
   width: 22px; height: 22px; border-radius: 50%; cursor: pointer;
@@ -1406,7 +1445,7 @@ dialog#labelModal .cond-logic:first-child { visibility: hidden; }
 dialog#labelModal .cond-input {
   flex: 1; min-width: 0; padding: 8px 12px; border: 1px solid #dcdfe6; border-radius: 4px; font: inherit;
 }
-dialog#labelModal .cond-input:focus { border-color: #0084ff; }
+dialog#labelModal .cond-input:focus { border-color: #d97a4e; }
 dialog#labelModal .cond-del {
   padding: 4px 10px; background: #f56c6c; color: #fff; border: none; border-radius: 4px;
   cursor: pointer; font-size: 12px; height: 32px;
@@ -1423,9 +1462,9 @@ dialog#labelModal button {
   padding: 6px 14px; border-radius: 6px; font: inherit; cursor: pointer; border: 1px solid #d0d7de;
 }
 dialog#labelModal button.btn-cancel { background: #f2f4f7; color: #555; }
-dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #2b80ff, #0056e0); color: #fff; border: none; }
+dialog#labelModal button.btn-primary { background: linear-gradient(135deg, #d97a4e, #e0a37a); color: #fff; border: none; }
 #ctxMenu .ctx-item { padding: 8px 14px; cursor: pointer; display: flex; align-items: center; gap: 8px; color: #333; }
-#ctxMenu .ctx-item:hover { background: #f0f6ff; }
+#ctxMenu .ctx-item:hover { background: #f4e3ca; }
 #ctxMenu .ctx-item.ctx-danger { color: #d4351c; }
 #ctxMenu .ctx-item.ctx-danger:hover { background: #fde8e6; }
 #ctxMenu .ctx-item i { width: 14px; text-align: center; }
@@ -1451,8 +1490,13 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 <body>
 
 <div class="header">
-  <div class="logo-area">
-    <img src="${INBOX_ROUTE}/api/asset/email-logo.png" alt="logo" style="height:44px;width:auto;object-fit:contain;">
+  <div class="header-actions">
+    <button class="btn-fetch" id="fetchBtn" type="button" title="收信">
+      <i class="fa-solid fa-inbox"></i> 收信
+    </button>
+    <button class="btn-compose" id="composeBtn" type="button" title="写信">
+      <i class="fa-solid fa-pen-to-square"></i> 写信
+    </button>
   </div>
   <div class="search-bar">
     <i class="fa-solid fa-magnifying-glass"></i>
@@ -1475,6 +1519,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 </div>
 <div id="ctxMenu" style="position:fixed; display:none; background:#fff; border:1px solid #e1e6ed; border-radius:6px; box-shadow:0 4px 12px rgba(0,0,0,0.12); padding:4px 0; min-width:140px; z-index:100; font-size:13px;">
   <div class="ctx-item" data-act="reply"><i class="fa-solid fa-reply"></i> 回复邮件</div>
+  <div class="ctx-item" data-act="forward"><i class="fa-solid fa-share"></i> 转发邮件</div>
   <div class="ctx-item" data-act="todo"><i class="fa-solid fa-list-check"></i> 设为待办</div>
   <div class="ctx-item" data-act="seen"><i class="fa-solid fa-envelope-open"></i> <span class="ctx-seen-label">设为已读</span></div>
   <div class="ctx-item ctx-danger" data-act="delete"><i class="fa-solid fa-trash"></i> 删除邮件</div>
@@ -1496,14 +1541,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 
 <div class="main-container" id="mainView">
   <div class="sidebar">
-    <div class="sidebar-action-row">
-      <button class="btn-fetch" id="fetchBtn" type="button" title="收信">
-        <i class="fa-solid fa-inbox"></i> 收信
-      </button>
-      <button class="btn-compose" id="composeBtn" type="button" title="写信">
-        <i class="fa-solid fa-pen-to-square"></i> 写信
-      </button>
-    </div>
     <div class="menu-group">
       <div class="menu-title">文件夹</div>
       <nav id="folders"></nav>
@@ -1524,6 +1561,9 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     <div class="list-toolbar">
       <label class="chk"><input type="checkbox" id="unreadOnly"> 只看未读</label>
       <span style="flex:1"></span>
+      <button id="markSeenBtn" class="btn-c" type="button" disabled style="display:none">
+        <i class="fa-solid fa-envelope-open"></i> 当前页标为已读
+      </button>
     </div>
     <ul id="messages"></ul>
     <button id="more" type="button" style="display:none">加载更多</button>
@@ -1566,7 +1606,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     <div id="conditionWrap"></div>
     <button type="button" class="btn-add-cond" id="addCondBtn">+ 新增条件</button>
     <input id="labelId" type="hidden">
-    <input id="labelColor" type="hidden" value="#0056e0">
+    <input id="labelColor" type="hidden" value="#e0a37a">
     <div class="actions">
       <button type="button" class="btn-cancel" id="labelCancel">取消</button>
       <button type="submit" class="btn-primary" id="labelSave">保存</button>
@@ -1597,7 +1637,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         <button type="button" class="btn-c" id="composeCancel">取消</button>
       </div>
       <div class="topbar-right">
-        <span id="composeCcToggle">抄送</span>
+        <span class="placeholder-tip">自动从原邮件带入抄送人</span>
       </div>
     </div>
     <div class="compose-body">
@@ -1607,7 +1647,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           <input id="composeTo" type="text" class="form-input recipient-input">
         </div>
       </div>
-      <div class="form-row" id="composeCcRow" style="display:none">
+      <div class="form-row" id="composeCcRow">
         <span class="form-label">抄 送：</span>
         <div class="recipient-container" id="composeCcContainer">
           <input id="composeCc" type="text" class="form-input recipient-input">
@@ -1624,6 +1664,65 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         <input id="composeAttachments" type="text" class="form-input" style="flex:1" readonly>
       </div>
       <div class="editor-container" style="position:relative">
+        <div class="editor-toolbar" id="forwardToolbar" style="display:none">
+          <span class="tool-btn" data-cmd="undo" title="撤销"><i class="fa-solid fa-rotate-left"></i></span>
+          <span class="tool-btn" data-cmd="redo" title="重做"><i class="fa-solid fa-rotate-right"></i></span>
+          <span class="tool-btn" data-cmd="removeFormat" title="清除格式"><i class="fa-solid fa-eraser"></i></span>
+          <span class="tb-divider"></span>
+          <select class="tool-select" id="forwardFontName" title="字体">
+            <option value="">默认字体</option>
+            <option value="SimSun, serif">宋体</option>
+            <option value="Microsoft YaHei, sans-serif">微软雅黑</option>
+            <option value="SimHei, sans-serif">黑体</option>
+            <option value="KaiTi, serif">楷体</option>
+            <option value="FangSong, serif">仿宋</option>
+            <option value="PingFang SC, sans-serif">苹方</option>
+            <option value="Hiragino Sans GB, sans-serif">冬青黑体</option>
+            <option value="STXihei, sans-serif">华文细黑</option>
+            <option value="STKaiti, serif">华文楷体</option>
+            <option value="STFangsong, serif">华文仿宋</option>
+            <option value="STSong, serif">华文宋体</option>
+            <option value="Arial, sans-serif">Arial</option>
+            <option value="Helvetica, sans-serif">Helvetica</option>
+            <option value="Georgia, serif">Georgia</option>
+            <option value="Times New Roman, serif">Times New Roman</option>
+            <option value="Courier New, monospace">Courier New</option>
+            <option value="Verdana, sans-serif">Verdana</option>
+            <option value="Tahoma, sans-serif">Tahoma</option>
+          </select>
+          <select class="tool-select" id="forwardFontSize" title="字号">
+            <option value="">字号</option>
+            <option value="12px">12px</option>
+            <option value="13px">13px</option>
+            <option value="14px">小四</option>
+            <option value="15px">15px</option>
+            <option value="16px">四号</option>
+            <option value="18px">小三</option>
+            <option value="20px">20px</option>
+            <option value="22px">三号</option>
+            <option value="24px">小二</option>
+            <option value="28px">28px</option>
+            <option value="32px">二号</option>
+          </select>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="bold" title="加粗" style="font-weight:bold">B</span>
+          <span class="tool-btn" data-cmd="italic" title="斜体" style="font-style:italic;font-family:Georgia,serif">I</span>
+          <span class="tool-btn" data-cmd="underline" title="下划线" style="text-decoration:underline">U</span>
+          <span class="tool-btn" data-cmd="strikeThrough" title="删除线" style="text-decoration:line-through">S</span>
+          <span class="tb-divider"></span>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="justifyLeft" title="左对齐"><i class="fa-solid fa-align-left"></i></span>
+          <span class="tool-btn" data-cmd="justifyCenter" title="居中"><i class="fa-solid fa-align-center"></i></span>
+          <span class="tool-btn" data-cmd="justifyRight" title="右对齐"><i class="fa-solid fa-align-right"></i></span>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="insertUnorderedList" title="无序列表"><i class="fa-solid fa-list-ul"></i></span>
+          <span class="tool-btn" data-cmd="insertOrderedList" title="有序列表"><i class="fa-solid fa-list-ol"></i></span>
+          <span class="tb-divider"></span>
+          <span class="tool-btn" data-cmd="outdent" title="减少缩进"><i class="fa-solid fa-outdent"></i></span>
+          <span class="tool-btn" data-cmd="indent" title="增加缩进"><i class="fa-solid fa-indent"></i></span>
+        </div>
+        <div id="forwardNote" contenteditable="true" style="display:none; min-height:120px; padding:12px 20px; outline:none; border:1px dashed #ddd; margin-bottom:8px; color:#222;" data-placeholder="在这里添加转发备注…"></div>
+        <iframe id="forwardFrame" referrerpolicy="no-referrer" title="原邮件正文" style="display:none; border:1px solid #eee; width:100%; background:#fff; min-height:600px;"></iframe>
         <div class="editor-toolbar">
           <span class="tool-btn" data-cmd="undo" title="撤销"><i class="fa-solid fa-rotate-left"></i></span>
           <span class="tool-btn" data-cmd="redo" title="重做"><i class="fa-solid fa-rotate-right"></i></span>
@@ -1711,8 +1810,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, labels: [] };
-  var LABEL_COLORS = ['#0056e0', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [] };
+  var LABEL_COLORS = ['#e0a37a', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -1996,6 +2095,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (todoBtn) todoBtn.classList.toggle('active', state.view === 'todo');
     var unreadBtn = document.getElementById('unreadBtn');
     if (unreadBtn) unreadBtn.classList.toggle('active', state.view === 'unread');
+    updateMarkSeenBtn();
   }
   function markActiveLabel() {
     var btns = document.querySelectorAll('#labels .menu-item');
@@ -2058,6 +2158,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var li = document.createElement('li');
       li.dataset.uid = String(t.uid);
       li.dataset.folder = t.folder;
+      li.dataset.seen = t.seen ? '1' : '0';
+      if (!t.seen) li.classList.add('unread');
       li.dataset.todoId = t.id;
       li.dataset.subject = t.subject || '(无主题)';
       li.dataset.from = t.from || '';
@@ -2108,6 +2210,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
     var more = document.getElementById('more');
     if (more) more.style.display = 'none';
+    updateMarkSeenBtn();
   }
 
   function fmtUnreadCount(n) {
@@ -2160,6 +2263,16 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       badge.remove();
     }
   }
+  function updateMarkSeenBtn() {
+    var btn = document.getElementById('markSeenBtn');
+    if (!btn) return;
+    var listViews = { folder: 1, label: 1, unread: 1, todo: 1 };
+    btn.style.display = listViews[state.view] ? '' : 'none';
+    var count = document.querySelectorAll('#messages li[data-uid][data-seen="0"]').length;
+    btn.disabled = count === 0;
+    btn.dataset.count = String(count);
+    btn.title = count > 0 ? ('当前列表有 ' + count + ' 封未读邮件') : '';
+  }
   function openUnreadView() {
     state.labelId = '';
     state.offset = 0;
@@ -2190,6 +2303,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         hint.textContent = '没有未读邮件';
         listEl.appendChild(hint);
       }
+      updateMarkSeenBtn();
     }).catch(function (err) { showBanner(err.message); });
   }
   function unreadRowEl(m) {
@@ -2381,6 +2495,10 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var p = parseAddr(a);
       return p.address || p.name;
     }).filter(Boolean).join(',');
+    li.dataset.cc = (m.cc || []).map(function (a) {
+      var p = parseAddr(a);
+      return p.address || p.name;
+    }).filter(Boolean).join(',');
     li.dataset.date = m.date || '';
     if (!m.seen) li.classList.add('unread');
     if (m.uid === state.uid) li.classList.add('active');
@@ -2426,6 +2544,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     menu.dataset.flagged = li.dataset.flagged;
     menu.dataset.subject = li.dataset.subject;
     menu.dataset.from = li.dataset.from;
+    menu.dataset.cc = li.dataset.cc || '';
     menu.dataset.date = li.dataset.date;
     menu.style.display = 'block';
     var x = e.clientX, y = e.clientY;
@@ -2450,12 +2569,17 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var flagged = menu.dataset.flagged === '1';
     var subject = menu.dataset.subject;
     var from = menu.dataset.from;
+    var cc = menu.dataset.cc;
     var date = menu.dataset.date;
     var isTodo = menu.dataset.isTodo === '1';
     var todoId = menu.dataset.todoId;
     closeCtxMenu();
     if (act === 'reply') {
-      startReply({ to: from, subject: subject });
+      startReply({ to: from, cc: cc, subject: subject });
+      return;
+    }
+    if (act === 'forward') {
+      startForward({ uid: uid, folder: folder, subject: subject, from: from, cc: cc, date: date });
       return;
     }
     if (isTodo && act === 'seen') {
@@ -2569,6 +2693,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         hint.textContent = value.count === 0 ? (state.view === 'label' ? '此标签没有匹配邮件' : '此文件夹没有邮件') : '没有更多邮件';
         listEl.appendChild(hint);
       }
+      updateMarkSeenBtn();
     }).catch(function (err) { showBanner(err.message); });
   }
   function silentRefresh() {
@@ -2737,6 +2862,47 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
     loadList();
   };
+  document.getElementById('markSeenBtn').onclick = function () {
+    if (this.disabled) return;
+    var targets = Array.from(document.querySelectorAll('#messages li[data-uid][data-seen="0"]'));
+    if (targets.length === 0) return;
+    var byFolder = {};
+    targets.forEach(function (li) {
+      var f = li.dataset.folder || state.folder;
+      (byFolder[f] = byFolder[f] || []).push(Number(li.dataset.uid));
+    });
+    var total = targets.length;
+    var promises = Object.keys(byFolder).map(function (folder) {
+      return fetch(BASE + '/api/mark-seen-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account: state.account, folder: folder, uids: byFolder[folder] }),
+      }).then(function (r) { return r.json().catch(function () { return null; }); });
+    });
+    this.disabled = true;
+    Promise.all(promises).then(function (results) {
+      var ok = Array.isArray(results) && results.length > 0 && results.every(function (r) { return r && r.ok; });
+      if (!ok) {
+        showBanner('部分邮件标记失败');
+        updateMarkSeenBtn();
+        return;
+      }
+      targets.forEach(function (li) {
+        li.classList.remove('unread');
+        li.dataset.seen = '1';
+      });
+      bumpUnreadBadge(-total);
+      Object.keys(byFolder).forEach(function (f) { bumpFolderBadge(f, -byFolder[f].length); });
+      if (state.unreadOnly) {
+        targets.forEach(function (li) { if (li.parentNode) li.parentNode.removeChild(li); });
+      }
+      showBanner('已将 ' + total + ' 封邮件标为已读');
+      updateMarkSeenBtn();
+    }).catch(function (err) {
+      showBanner((err && err.message) || '批量标记失败');
+      updateMarkSeenBtn();
+    });
+  };
   var logoutBtn = document.getElementById('logoutBtn');
   if (logoutBtn) {
     logoutBtn.onclick = function () {
@@ -2853,28 +3019,38 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
   });
   var composeEditor = document.getElementById('composeEditor');
+  var forwardNote = document.getElementById('forwardNote');
+  var forwardToolbar = document.getElementById('forwardToolbar');
+  var activeEditor = composeEditor;
+  function setActiveEditor(el) { if (el === composeEditor || el === forwardNote) activeEditor = el; }
+  composeEditor.addEventListener('focus', function () { setActiveEditor(composeEditor); });
+  forwardNote.addEventListener('focus', function () { setActiveEditor(forwardNote); });
+  composeEditor.addEventListener('mouseup', function () { setActiveEditor(composeEditor); });
+  forwardNote.addEventListener('mouseup', function () { setActiveEditor(forwardNote); });
+  composeEditor.addEventListener('keyup', function () { setActiveEditor(composeEditor); });
+  forwardNote.addEventListener('keyup', function () { setActiveEditor(forwardNote); });
   var savedRange = null;
   function saveSel() {
     var sel = window.getSelection();
-    if (sel && sel.rangeCount && composeEditor.contains(sel.anchorNode)) {
+    if (sel && sel.rangeCount && activeEditor.contains(sel.anchorNode)) {
       savedRange = sel.getRangeAt(0).cloneRange();
     }
   }
   function restoreSel() {
+    activeEditor.focus();
     if (savedRange) {
-      composeEditor.focus();
       var sel = window.getSelection();
       sel.removeAllRanges(); sel.addRange(savedRange);
       return true;
     }
-    composeEditor.focus();
     return false;
   }
   composeEditor.addEventListener('blur', saveSel);
+  forwardNote.addEventListener('blur', saveSel);
   function exec(cmd, val) {
     restoreSel();
     document.execCommand(cmd, false, val || null);
-    composeEditor.focus();
+    activeEditor.focus();
     saveSel();
     updateTbActive();
   }
@@ -2890,44 +3066,53 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }
   }
   document.querySelectorAll('#composeModal .tool-btn[data-cmd]').forEach(function (el) {
-    el.onclick = function () { exec(el.dataset.cmd); };
+    el.onmousedown = function (e) { e.preventDefault(); };
+    el.onclick = function () { setActiveEditor(activeEditor); exec(el.dataset.cmd); };
   });
-  document.getElementById('composeFontName').onchange = function () { exec('fontName', this.value); };
-  document.getElementById('composeFontSize').onchange = function () {
-    var px = this.value;
-    if (!px) return;
-    restoreSel();
-    var sel = window.getSelection();
-    if (!sel || !sel.rangeCount) { composeEditor.focus(); return; }
-    var range = sel.getRangeAt(0);
-    if (range.collapsed) {
-      var span = document.createElement('span');
-      span.style.fontSize = px;
-      span.appendChild(document.createTextNode('\u200b'));
-      range.insertNode(span);
-      range.setStart(span.firstChild, 1);
-      range.setEnd(span.firstChild, 1);
-      sel.removeAllRanges(); sel.addRange(range);
-    } else {
-      document.execCommand('styleWithCSS', false, true);
-      document.execCommand('fontSize', false, '7');
-      document.execCommand('styleWithCSS', false, false);
-      var fonts = composeEditor.querySelectorAll('font[size="7"]');
-      for (var i = 0; i < fonts.length; i++) {
-        fonts[i].removeAttribute('size');
-        fonts[i].style.fontSize = px;
-        if (fonts[i].tagName === 'FONT') {
-          var span2 = document.createElement('span');
-          span2.style.fontSize = px;
-          while (fonts[i].firstChild) span2.appendChild(fonts[i].firstChild);
-          fonts[i].parentNode.replaceChild(span2, fonts[i]);
+  function bindFontSelect(sel) {
+    sel.onchange = function () { exec('fontName', this.value); };
+  }
+  bindFontSelect(document.getElementById('composeFontName'));
+  bindFontSelect(document.getElementById('forwardFontName'));
+  function bindFontSize(sel) {
+    sel.onchange = function () {
+      var px = this.value;
+      if (!px) return;
+      restoreSel();
+      var selObj = window.getSelection();
+      if (!selObj || !selObj.rangeCount) { activeEditor.focus(); return; }
+      var range = selObj.getRangeAt(0);
+      if (range.collapsed) {
+        var span = document.createElement('span');
+        span.style.fontSize = px;
+        span.appendChild(document.createTextNode(''));
+        range.insertNode(span);
+        range.setStart(span.firstChild, 1);
+        range.setEnd(span.firstChild, 1);
+        selObj.removeAllRanges(); selObj.addRange(range);
+      } else {
+        document.execCommand('styleWithCSS', false, true);
+        document.execCommand('fontSize', false, '7');
+        document.execCommand('styleWithCSS', false, false);
+        var fonts = activeEditor.querySelectorAll('font[size="7"]');
+        for (var i = 0; i < fonts.length; i++) {
+          fonts[i].removeAttribute('size');
+          fonts[i].style.fontSize = px;
+          if (fonts[i].tagName === 'FONT') {
+            var span2 = document.createElement('span');
+            span2.style.fontSize = px;
+            while (fonts[i].firstChild) span2.appendChild(fonts[i].firstChild);
+            fonts[i].parentNode.replaceChild(span2, fonts[i]);
+          }
         }
       }
-    }
-    composeEditor.focus();
-    saveSel();
-    updateTbActive();
-  };
+      activeEditor.focus();
+      saveSel();
+      updateTbActive();
+    };
+  }
+  bindFontSize(document.getElementById('composeFontSize'));
+  bindFontSize(document.getElementById('forwardFontSize'));
   var foreInput = document.getElementById('composeForeColor');
   var foreBar = document.getElementById('foreColorBar');
   var colorPick = document.getElementById('composeColorPick');
@@ -2938,7 +3123,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     document.execCommand('foreColor', false, color);
     document.execCommand('styleWithCSS', false, false);
     foreBar.style.background = color;
-    composeEditor.focus(); saveSel(); updateTbActive();
+    activeEditor.focus(); saveSel(); updateTbActive();
   }
   var rows = colorPalette.querySelectorAll('.palette-grid');
   for (var r = 0; r < rows.length; r++) {
@@ -2965,6 +3150,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   });
   composeEditor.onkeyup = updateTbActive;
   composeEditor.onmouseup = updateTbActive;
+  forwardNote.onkeyup = updateTbActive;
+  forwardNote.onmouseup = updateTbActive;
 
   composeEditor.addEventListener('paste', function (e) {
     var cd = e.clipboardData || window.clipboardData;
@@ -3079,11 +3266,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   });
   window.addEventListener('scroll', hideImgToolbar, true);
 
-  document.getElementById('composeCcToggle').onclick = function () {
-    var row = document.getElementById('composeCcRow');
-    row.style.display = row.style.display === 'none' ? '' : 'none';
-  };
-
   var AC_RELAY = BASE + '/api/dir-search';
   var acBox = document.getElementById('acBox');
   var acTimer = null;
@@ -3152,13 +3334,14 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   function getRecipients(container) {
     var mails = [];
     container.querySelectorAll('.recipient-tag').forEach(function (tag) {
+      if (tag.classList.contains('invalid')) return;
       if (tag.dataset.mail) mails.push(tag.dataset.mail);
     });
     var input = container.querySelector('.recipient-input');
     if (input) {
       var residual = String(input.value || '').trim();
       if (residual) {
-        residual.split(/[;,\\s]+/).filter(Boolean).forEach(function (m) { mails.push(m); });
+        residual.split(/[;,\\s]+/).filter(function (m) { return EMAIL_RE.test(m); }).forEach(function (m) { mails.push(m); });
       }
     }
     return mails;
@@ -3257,8 +3440,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   document.getElementById('composeModal').addEventListener('close', acClose);
 
   function openPreview() {
-    var to = getRecipients(document.getElementById('composeToContainer')).join('; ');
-    var cc = getRecipients(document.getElementById('composeCcContainer')).join('; ');
+    var to = getRecipients(document.getElementById('composeToContainer')).join(', ');
+    var cc = getRecipients(document.getElementById('composeCcContainer')).join(', ');
     var subject = document.getElementById('composeSubject').value.trim();
     var html = composeEditor.innerHTML;
     var text = composeEditor.innerText.trim();
@@ -3281,8 +3464,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 
   function saveDraft() {
     var draft = {
-      to: getRecipients(document.getElementById('composeToContainer')).join('; '),
-      cc: getRecipients(document.getElementById('composeCcContainer')).join('; '),
+      to: getRecipients(document.getElementById('composeToContainer')).join(', '),
+      cc: getRecipients(document.getElementById('composeCcContainer')).join(', '),
       subject: document.getElementById('composeSubject').value,
       html: composeEditor.innerHTML,
       attachments: document.getElementById('composeAttachments').value,
@@ -3352,11 +3535,33 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   }
 
   function doSend() {
-    var to = getRecipients(document.getElementById('composeToContainer')).join('; ');
-    var cc = getRecipients(document.getElementById('composeCcContainer')).join('; ');
+    var to = getRecipients(document.getElementById('composeToContainer')).join(', ');
+    var cc = getRecipients(document.getElementById('composeCcContainer')).join(', ');
     var subject = document.getElementById('composeSubject').value.trim();
-    var html = composeEditor.innerHTML.trim();
-    var text = composeEditor.innerText.trim();
+    var noteEl = document.getElementById('forwardNote');
+    var noteVisible = noteEl && noteEl.style.display !== 'none';
+    var noteHtml = noteVisible ? noteEl.innerHTML.trim() : '';
+    var noteText = noteVisible ? noteEl.innerText.trim() : '';
+    var headerHtml = composeEditor.innerHTML.trim();
+    var headerText = composeEditor.innerText.trim();
+    var frameHtml = '';
+    var frameText = '';
+    if (noteVisible) {
+      var frame = document.getElementById('forwardFrame');
+      if (frame) {
+        try {
+          var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+          if (doc && doc.body) {
+            frameHtml = doc.body.innerHTML.trim();
+            frameText = doc.body.innerText.trim();
+          }
+        } catch (e) { /* ignore cross-origin */ }
+      }
+    }
+    var origHtml = frameHtml ? (headerHtml + frameHtml) : headerHtml;
+    var origText = frameText ? (headerText + '\\n\\n' + frameText) : headerText;
+    var html = noteHtml ? (noteHtml + '<br>' + origHtml) : (origHtml || composeEditor.innerHTML.trim());
+    var text = noteText ? (noteText + '\\n\\n' + origText) : (origText || composeEditor.innerText.trim());
     var atts = document.getElementById('composeAttachments').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
     var msg = document.getElementById('composeMsg');
     if (!to) { msg.textContent = '请填写收件人'; return; }
@@ -3392,8 +3597,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     document.getElementById('composeSubject').value = '';
     document.getElementById('composeAttachments').value = '';
     composeEditor.innerHTML = '';
-    document.getElementById('composeCcRow').style.display = 'none';
     document.getElementById('composeMsg').textContent = '';
+    resetForwardView();
   }
   document.getElementById('composeBtn').onclick = function () {
     loadFromInfo();
@@ -3404,16 +3609,123 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   function startReply(orig) {
     loadFromInfo();
     setRecipients(document.getElementById('composeToContainer'), orig.to || '');
-    setRecipients(document.getElementById('composeCcContainer'), '');
+    setRecipients(document.getElementById('composeCcContainer'), orig.cc || '');
     var subj = orig.subject || '';
     document.getElementById('composeSubject').value = /^Re:/i.test(subj) ? subj : 'Re: ' + subj;
     composeEditor.innerHTML = '';
-    document.getElementById('composeCcRow').style.display = 'none';
     document.getElementById('composeModal').showModal();
     composeEditor.focus();
   }
-  document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').close(); };
-  document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').close(); };
+  function startForward(orig) {
+    loadFromInfo();
+    setRecipients(document.getElementById('composeToContainer'), '');
+    setRecipients(document.getElementById('composeCcContainer'), '');
+    document.getElementById('composeAttachments').value = '';
+    var subj = orig.subject || '';
+    document.getElementById('composeSubject').value = /^Fwd:/i.test(subj) ? subj : 'Fwd: ' + subj;
+    var editorContainer = document.querySelector('.editor-container');
+    var mainToolbar = document.querySelector('.editor-container .editor-toolbar:not(#forwardToolbar)');
+    var frame = document.getElementById('forwardFrame');
+    var note = document.getElementById('forwardNote');
+    var body = document.querySelector('#composeModal .compose-body');
+    composeEditor.style.display = 'none';
+    if (mainToolbar) mainToolbar.style.display = 'none';
+    forwardToolbar.style.display = 'flex';
+    note.style.display = 'block';
+    note.innerHTML = '';
+    frame.style.display = 'block';
+    frame.style.height = '';
+    if (body) { body.style.overflow = 'visible'; body.style.flex = 'none'; }
+    document.getElementById('composeModal').showModal();
+    setActiveEditor(note);
+    note.focus();
+    api('/api/message', { account: state.account, folder: orig.folder, uid: orig.uid }).then(function (v) {
+      var fmtAddr = function (a) {
+        if (!a) return '';
+        if (typeof a === 'string') return a;
+        var name = a.name || '';
+        var box = a.address || a.email || '';
+        if (name && box) return name + ' <' + box + '>';
+        return name || box;
+      };
+      var fromStr = (Array.isArray(v.from) ? v.from : []).map(fmtAddr).filter(Boolean).join(', ') || orig.from || '';
+      var dateStr = v.date ? new Date(v.date).toUTCString() : (orig.date || '');
+      var toArr = Array.isArray(v.to) ? v.to.map(fmtAddr).filter(Boolean) : [];
+      var toStr = toArr.join(', ');
+      var subjectStr = v.subject || orig.subject || '';
+      var header =
+        '<div style="border:1px solid #ddd;border-radius:4px;padding:8px 12px;margin-bottom:10px;color:#666;font-size:12px;line-height:1.6;background:#fafafa">' +
+          '<div style="color:#999">---------- Forwarded message ----------</div>' +
+          '<div>From: ' + esc(fromStr) + '</div>' +
+          '<div>Date: ' + esc(dateStr) + '</div>' +
+          '<div>Subject: ' + esc(subjectStr) + '</div>' +
+          (toStr ? '<div>To: ' + esc(toStr) + '</div>' : '') +
+        '</div>';
+      composeEditor.innerHTML = header;
+      frame.onload = function () {
+        if (state.forwardToken !== token) return;
+        try {
+          var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+          if (!doc || !doc.body) return;
+          var applySize = function () {
+            if (state.forwardToken !== token) return false;
+            try {
+              var d = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+              if (!d || !d.body) return false;
+              var h = Math.max(d.body.scrollHeight, d.documentElement ? d.documentElement.scrollHeight : 0);
+              if (h > 0) frame.style.height = h + 'px';
+              return true;
+            } catch (e) { return false; }
+          };
+          applySize();
+          var attempts = 0;
+          var trySize = function () {
+            if (state.forwardToken !== token) return;
+            if (applySize()) attempts++;
+            if (attempts < 20) setTimeout(trySize, 300);
+          };
+          trySize();
+          if (typeof ResizeObserver !== 'undefined') {
+            try {
+              var ro = new ResizeObserver(function () { applySize(); });
+              ro.observe(doc.body);
+              if (doc.documentElement) ro.observe(doc.documentElement);
+              frame._ro = ro;
+            } catch (e) { /* ignore */ }
+          }
+        } catch (e) { /* ignore */ }
+      };
+      var token = ++state.forwardToken;
+      frame.src = BASE + '/api/message.html' + qs({
+        account: state.account, folder: orig.folder, uid: orig.uid, images: 1,
+      });
+      if (Array.isArray(v.attachments) && v.attachments.length) {
+        document.getElementById('composeAttachments').value =
+          v.attachments.map(function (a) { return (a && a.filename) ? a.filename : String(a); }).join(', ');
+      }
+    }).catch(function (err) {
+      composeEditor.style.display = '';
+      if (toolbar) toolbar.style.display = '';
+      note.style.display = 'none';
+      frame.style.display = 'none';
+      composeEditor.innerHTML = '<div style="color:#cf222e">加载原邮件失败：' + esc(err && err.message || err) + '</div>';
+    });
+  }
+  function resetForwardView() {
+    var frame = document.getElementById('forwardFrame');
+    var note = document.getElementById('forwardNote');
+    var mainToolbar = document.querySelector('.editor-container .editor-toolbar:not(#forwardToolbar)');
+    var body = document.querySelector('#composeModal .compose-body');
+    if (frame) { frame.style.display = 'none'; frame.removeAttribute('src'); if (frame._ro) { frame._ro.disconnect(); frame._ro = null; } }
+    if (note) { note.style.display = 'none'; note.innerHTML = ''; }
+    forwardToolbar.style.display = 'none';
+    if (mainToolbar) mainToolbar.style.display = '';
+    if (body) { body.style.overflow = ''; body.style.flex = ''; }
+    composeEditor.style.display = '';
+    setActiveEditor(composeEditor);
+  }
+  document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').close(); resetForwardView(); };
+  document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').close(); resetForwardView(); };
   document.getElementById('composeSend').onclick = doSend;
   document.getElementById('composeSend2').onclick = doSend;
   document.getElementById('composeForm').onsubmit = function (e) { e.preventDefault(); doSend(); };

@@ -199,3 +199,87 @@ test('messages-unread with unconfigured account answers 400', async () => {
   assert.equal(res.statusCode, 400)
   assert.equal(res.json().error.code, 'bad-request')
 })
+
+async function postJson(route, path, body) {
+  const req = {
+    method: 'POST',
+    url: path,
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'content-type': 'application/json' },
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(JSON.stringify(body), 'utf8')
+    },
+  }
+  return call(route, req)
+}
+
+test('POST /api/mark-seen-batch calls pool with grouped uids and returns count', async () => {
+  const calls = []
+  const holder = installRoute(() => ({
+    markSeenBatch: async (account, folder, uids) => {
+      calls.push({ account, folder, uids })
+    },
+  }))
+  const res = await postJson(holder.routes[0], INBOX_ROUTE + '/api/mark-seen-batch', {
+    account: 'a@b.com', folder: 'INBOX', uids: [1, 2, 3],
+  })
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(calls, [{ account: 'a@b.com', folder: 'INBOX', uids: [1, 2, 3] }])
+  assert.deepEqual(res.json().value, { count: 3 })
+})
+
+test('POST /api/mark-seen-batch noops on empty uids', async () => {
+  let called = false
+  const holder = installRoute(() => ({
+    markSeenBatch: async () => { called = true },
+  }))
+  const res = await postJson(holder.routes[0], INBOX_ROUTE + '/api/mark-seen-batch', {
+    account: 'a@b.com', folder: 'INBOX', uids: [],
+  })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.json().ok, true)
+  assert.equal(called, false)
+})
+
+test('POST /api/mark-seen-batch 400 when folder missing', async () => {
+  let called = false
+  const holder = installRoute(() => ({
+    markSeenBatch: async () => { called = true; throw new Error('should not reach pool') },
+  }))
+  const res = await postJson(holder.routes[0], INBOX_ROUTE + '/api/mark-seen-batch', {
+    account: 'a@b.com', uids: [1],
+  })
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().error.code, 'bad-request')
+  assert.equal(called, false)
+})
+
+test('POST /api/mark-seen-batch 400 when uids is not array', async () => {
+  const holder = installRoute(() => ({
+    markSeenBatch: async () => { throw new Error('should not reach pool') },
+  }))
+  const res = await postJson(holder.routes[0], INBOX_ROUTE + '/api/mark-seen-batch', {
+    account: 'a@b.com', folder: 'INBOX', uids: 'oops',
+  })
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().error.code, 'bad-request')
+})
+
+test('POST /api/mark-seen-batch rejects non-loopback clients', async () => {
+  let called = false
+  const holder = installRoute(() => ({
+    markSeenBatch: async () => { called = true },
+  }))
+  const req = {
+    method: 'POST',
+    url: INBOX_ROUTE + '/api/mark-seen-batch',
+    socket: { remoteAddress: '10.0.0.5' },
+    headers: { 'content-type': 'application/json' },
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(JSON.stringify({ folder: 'INBOX', uids: [1] }), 'utf8')
+    },
+  }
+  const res = await call(holder.routes[0], req)
+  assert.equal(res.statusCode, 403)
+  assert.equal(called, false)
+})
