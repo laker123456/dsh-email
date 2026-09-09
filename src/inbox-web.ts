@@ -1,7 +1,7 @@
-import { mkdir, writeFile, readFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { mkdir, writeFile, readFile, lstat } from 'node:fs/promises'
+import { dirname, join, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { clampInt, PROVIDER_NAMES, PROVIDER_PRESETS } from './config.js'
 import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
@@ -447,28 +447,45 @@ async function handleMove(getPool: () => EmailPool, req: any, res: any): Promise
   }
 }
 
+const TIME_AUTH_MAX_BYTES = 16 * 1024
+
+/** Mirrors weban-time's TimeAuthResolver so dir-search resolves the same credential file on every platform. */
+async function loadTimeAuth(): Promise<{ key: string; username: string } | null> {
+  const home = homedir()
+  const override = process.env.WEBAN_TIME_AUTH_FILE?.trim()
+  const candidates: Array<{ path: string; weban: boolean }> = []
+  if (override !== undefined && override !== '') {
+    if (!isAbsolute(override)) return null
+    candidates.push({ path: override, weban: true })
+  } else {
+    const product = process.platform === 'win32'
+      ? join(process.env.APPDATA?.trim() || join(home, 'AppData', 'Roaming'), 'Weban Desktop', 'config', 'auth.json')
+      : process.platform === 'darwin'
+        ? join(home, 'Library', 'Application Support', 'Weban Desktop', 'config', 'auth.json')
+        : join(process.env.XDG_CONFIG_HOME?.trim() || join(home, '.config'), 'Weban Desktop', 'config', 'auth.json')
+    candidates.push({ path: product, weban: true }, { path: join(home, '.time', 'config.json'), weban: false })
+  }
+  for (const { path, weban } of candidates) {
+    try {
+      const info = await lstat(path)
+      if (!info.isFile() || info.isSymbolicLink() || info.size <= 1 || info.size > TIME_AUTH_MAX_BYTES) continue
+      const j = JSON.parse(await readFile(path, 'utf8'))
+      const key = (weban ? j.key : j['API-KEY']) as unknown
+      const username = (weban ? j.username : j.OPERATOR) as unknown
+      if (typeof key === 'string' && typeof username === 'string' && key.trim() !== '' && username.trim() !== '') {
+        return { key: key.trim(), username: username.trim() }
+      }
+    } catch { /* try next */ }
+  }
+  return null
+}
+
 /** GET /api/dir-search?q=... → proxy time.weoa.com queryUserOrGroups with X-API-Key + OPERATOR from Weban auth.json. */
 async function handleDirSearch(req: any, res: any): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost')
   const q = (url.searchParams.get('q') ?? '').trim()
   if (q === '') { responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'q 不能为空' } }); return }
-  const home = process.env.HOME ?? ''
-  const candidates = [
-    process.env.WEBAN_TIME_AUTH_FILE ?? '',
-    home + '/Library/Application Support/Weban Desktop/config/auth.json',
-    home + '/.config/Weban Desktop/config/auth.json',
-    home + '/.time/config.json',
-  ].filter(Boolean)
-  let auth: { key?: string; username?: string; 'API-KEY'?: string; OPERATOR?: string } | null = null
-  for (const p of candidates) {
-    try {
-      const raw = await readFile(p, 'utf8')
-      const j = JSON.parse(raw)
-      const key = j.key ?? j['API-KEY']
-      const username = j.username ?? j.OPERATOR
-      if (key && username) { auth = { key, username }; break }
-    } catch { /* try next */ }
-  }
+  const auth = await loadTimeAuth()
   if (!auth) {
     responseJson(res, 500, { ok: false, error: { code: 'no-auth', message: '未找到 WeBank TIME 鉴权（请在 We伴 桌面端宠物日程弹窗授权，或写 ~/.time/config.json）' } })
     return
@@ -1572,7 +1589,9 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   <div class="reader">
     <div class="reader-toolbar">
       <div class="left">
-        <span></span>
+        <button type="button" id="zoomOut" title="缩小"><i class="fa-solid fa-minus"></i></button>
+        <span id="zoomPct" style="min-width:42px; text-align:center; cursor:pointer" title="点击还原 100%">100%</span>
+        <button type="button" id="zoomIn" title="放大"><i class="fa-solid fa-plus"></i></button>
       </div>
       <div class="right" id="readerMeta"></div>
     </div>
@@ -1810,7 +1829,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [] };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [], zoom: 1 };
   var LABEL_COLORS = ['#e0a37a', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
@@ -2772,11 +2791,47 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         } catch (e) { /* ignore */ }
       };
       trySize();
+      applyZoom();
     };
     frame.src = BASE + '/api/message.html' + qs({
       account: state.account, folder: folder, uid: uid, images: state.imagesAllowed,
     });
   }
+
+  function applyZoom() {
+    var frame = document.getElementById('frame');
+    if (!frame) return;
+    try {
+      var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+      if (doc && doc.body) {
+        doc.body.style.zoom = (state.zoom * 100) + '%';
+        doc.documentElement.style.zoom = (state.zoom * 100) + '%';
+      }
+    } catch (e) { /* ignore cross-origin */ }
+    var pct = Math.round(state.zoom * 100) + '%';
+    var label = document.getElementById('zoomPct');
+    if (label) label.textContent = pct;
+  }
+  document.getElementById('zoomOut').onclick = function () {
+    state.zoom = Math.max(0.5, Math.round((state.zoom - 0.1) * 10) / 10);
+    applyZoom();
+  };
+  document.getElementById('zoomIn').onclick = function () {
+    state.zoom = Math.min(2, Math.round((state.zoom + 0.1) * 10) / 10);
+    applyZoom();
+  };
+  document.getElementById('zoomPct').onclick = function () {
+    state.zoom = 1;
+    applyZoom();
+  };
+  document.addEventListener('keydown', function (e) {
+    if (!(e.metaKey || e.ctrlKey)) return;
+    var tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
+    if (e.key === '=' || e.key === '+') { state.zoom = Math.min(2, Math.round((state.zoom + 0.1) * 10) / 10); applyZoom(); e.preventDefault(); }
+    else if (e.key === '-') { state.zoom = Math.max(0.5, Math.round((state.zoom - 0.1) * 10) / 10); applyZoom(); e.preventDefault(); }
+    else if (e.key === '0') { state.zoom = 1; applyZoom(); e.preventDefault(); }
+  });
 
   function openMessage(uid, folder) {
     var effFolder = folder || state.folder;
