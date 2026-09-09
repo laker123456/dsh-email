@@ -2594,7 +2594,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var todoId = menu.dataset.todoId;
     closeCtxMenu();
     if (act === 'reply') {
-      startReply({ to: from, cc: cc, subject: subject });
+      startReply({ uid: uid, folder: folder, subject: subject, to: from, cc: cc, from: from, date: date });
       return;
     }
     if (act === 'forward') {
@@ -3661,27 +3661,23 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     document.getElementById('composeModal').showModal();
     document.getElementById('composeTo').focus();
   };
-  function startReply(orig) {
+  function startReply(orig) { startQuoted(orig, 'reply'); }
+  function startForward(orig) { startQuoted(orig, 'forward'); }
+  function startQuoted(orig, mode) {
+    var isReply = mode === 'reply';
     loadFromInfo();
-    setRecipients(document.getElementById('composeToContainer'), orig.to || '');
-    setRecipients(document.getElementById('composeCcContainer'), orig.cc || '');
-    var subj = orig.subject || '';
-    document.getElementById('composeSubject').value = /^Re:/i.test(subj) ? subj : 'Re: ' + subj;
-    composeEditor.innerHTML = '';
-    document.getElementById('composeModal').showModal();
-    composeEditor.focus();
-  }
-  function startForward(orig) {
-    loadFromInfo();
-    setRecipients(document.getElementById('composeToContainer'), '');
-    setRecipients(document.getElementById('composeCcContainer'), '');
+    setRecipients(document.getElementById('composeToContainer'), isReply ? (orig.to || '') : '');
+    setRecipients(document.getElementById('composeCcContainer'), isReply ? (orig.cc || '') : '');
     document.getElementById('composeAttachments').value = '';
     var subj = orig.subject || '';
-    document.getElementById('composeSubject').value = /^Fwd:/i.test(subj) ? subj : 'Fwd: ' + subj;
-    var editorContainer = document.querySelector('.editor-container');
+    var subjTest = isReply ? /^Re:/i : /^Fwd:/i;
+    var subjPrefix = isReply ? 'Re: ' : 'Fwd: ';
+    document.getElementById('composeSubject').value = subjTest.test(subj) ? subj : subjPrefix + subj;
+    var quoteLabel = isReply ? '---------- 原始邮件 ----------' : '---------- Forwarded message ----------';
+    var note = document.getElementById('forwardNote');
+    note.dataset.placeholder = isReply ? '在这里输入回复内容…' : '在这里添加转发备注…';
     var mainToolbar = document.querySelector('.editor-container .editor-toolbar:not(#forwardToolbar)');
     var frame = document.getElementById('forwardFrame');
-    var note = document.getElementById('forwardNote');
     var body = document.querySelector('#composeModal .compose-body');
     composeEditor.style.display = 'none';
     if (mainToolbar) mainToolbar.style.display = 'none';
@@ -3710,7 +3706,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var subjectStr = v.subject || orig.subject || '';
       var header =
         '<div style="border:1px solid #ddd;border-radius:4px;padding:8px 12px;margin-bottom:10px;color:#666;font-size:12px;line-height:1.6;background:#fafafa">' +
-          '<div style="color:#999">---------- Forwarded message ----------</div>' +
+          '<div style="color:#999">' + quoteLabel + '</div>' +
           '<div>From: ' + esc(fromStr) + '</div>' +
           '<div>Date: ' + esc(dateStr) + '</div>' +
           '<div>Subject: ' + esc(subjectStr) + '</div>' +
@@ -3760,7 +3756,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       }
     }).catch(function (err) {
       composeEditor.style.display = '';
-      if (toolbar) toolbar.style.display = '';
+      if (mainToolbar) mainToolbar.style.display = '';
       note.style.display = 'none';
       frame.style.display = 'none';
       composeEditor.innerHTML = '<div style="color:#cf222e">加载原邮件失败：' + esc(err && err.message || err) + '</div>';
@@ -3772,7 +3768,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var mainToolbar = document.querySelector('.editor-container .editor-toolbar:not(#forwardToolbar)');
     var body = document.querySelector('#composeModal .compose-body');
     if (frame) { frame.style.display = 'none'; frame.removeAttribute('src'); if (frame._ro) { frame._ro.disconnect(); frame._ro = null; } }
-    if (note) { note.style.display = 'none'; note.innerHTML = ''; }
+    if (note) { note.style.display = 'none'; note.innerHTML = ''; note.dataset.placeholder = '在这里添加转发备注…'; }
     forwardToolbar.style.display = 'none';
     if (mainToolbar) mainToolbar.style.display = '';
     if (body) { body.style.overflow = ''; body.style.flex = ''; }
