@@ -157,7 +157,10 @@ function describeMessage(message: EmailListResult['messages'][number]): string {
     message.flagged ? '已标星' : '',
     message.hasAttachments ? '含附件' : '',
   ].filter(Boolean)
-  const parts = ['uid=' + message.uid, from, message.date]
+  const dateDisplay = message.dateLocal
+    ? message.dateLocal + (message.date ? '（' + message.date + '）' : '')
+    : (message.date || '')
+  const parts = ['uid=' + message.uid, from, dateDisplay]
   if (flags.length > 0) parts.push(flags.join('、'))
   return (message.subject || '(无主题)') + ' [' + parts.join(' | ') + ']'
 }
@@ -175,7 +178,10 @@ function renderRead(value: EmailReadResult): TextBlock[] {
   const attach = value.attachments.length > 0
     ? '\n附件：' + value.attachments.map((a, i) => '#' + i + ' ' + a.filename + '（' + a.contentType + '，' + a.size + ' 字节）').join('；') + '\n（用 email_attachment 配合 uid 与序号下载）'
     : ''
-  return oneText('账号 ' + value.account + '，主题：' + (value.subject || '(无主题)') + '\n来自：' + from + '\n时间：' + (value.date || '(未知)') + attach + '\n\n' + value.text)
+  const dateDisplay = value.dateLocal
+    ? value.dateLocal + (value.date ? '（' + value.date + '）' : '')
+    : (value.date || '(未知)')
+  return oneText('账号 ' + value.account + '，主题：' + (value.subject || '(无主题)') + '\n来自：' + from + '\n时间：' + dateDisplay + attach + '\n\n' + value.text)
 }
 
 function renderSearch(value: EmailSearchResult): TextBlock[] {
