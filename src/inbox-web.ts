@@ -1741,6 +1741,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           <span class="tool-btn" data-cmd="indent" title="增加缩进"><i class="fa-solid fa-indent"></i></span>
         </div>
         <div id="forwardNote" contenteditable="true" style="display:none; min-height:120px; padding:12px 20px; outline:none; border:1px dashed #ddd; margin-bottom:8px; color:#222;" data-placeholder="在这里添加转发备注…"></div>
+        <div id="forwardHeader" style="display:none"></div>
         <iframe id="forwardFrame" referrerpolicy="no-referrer" title="原邮件正文" style="display:none; border:1px solid #eee; width:100%; background:#fff; min-height:600px;"></iframe>
         <div class="editor-toolbar">
           <span class="tool-btn" data-cmd="undo" title="撤销"><i class="fa-solid fa-rotate-left"></i></span>
@@ -3685,6 +3686,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     forwardToolbar.style.display = 'flex';
     note.style.display = 'block';
     note.innerHTML = '';
+    var headerEl = document.getElementById('forwardHeader');
+    if (headerEl) { headerEl.style.display = 'none'; headerEl.innerHTML = ''; }
     frame.style.display = 'block';
     frame.style.height = '';
     if (body) { body.style.overflow = 'visible'; body.style.flex = 'none'; }
@@ -3713,7 +3716,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           '<div>Subject: ' + esc(subjectStr) + '</div>' +
           (toStr ? '<div>To: ' + esc(toStr) + '</div>' : '') +
         '</div>';
-      composeEditor.innerHTML = header;
+      var headerEl = document.getElementById('forwardHeader');
+      if (headerEl) { headerEl.innerHTML = header; headerEl.style.display = 'block'; }
       frame.onload = function () {
         if (state.forwardToken !== token) return;
         try {
@@ -3770,6 +3774,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var body = document.querySelector('#composeModal .compose-body');
     if (frame) { frame.style.display = 'none'; frame.removeAttribute('src'); if (frame._ro) { frame._ro.disconnect(); frame._ro = null; } }
     if (note) { note.style.display = 'none'; note.innerHTML = ''; note.dataset.placeholder = '在这里添加转发备注…'; }
+    var headerEl = document.getElementById('forwardHeader');
+    if (headerEl) { headerEl.style.display = 'none'; headerEl.innerHTML = ''; }
     forwardToolbar.style.display = 'none';
     if (mainToolbar) mainToolbar.style.display = '';
     if (body) { body.style.overflow = ''; body.style.flex = ''; }

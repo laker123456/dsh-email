@@ -114,7 +114,7 @@ export interface HtmlMessageView {
   attachments: EmailAttachmentMeta[]
 }
 
-const MAX_HTML_CHARS = 2 * 1024 * 1024
+const MAX_HTML_CHARS = 20 * 1024 * 1024
 const CID_SRC_RE = /\ssrc\s*=\s*(["'])cid:([^"'>]+)\1/gi
 const REMOTE_IMG_RE = /<img[^>]*?\ssrc\s*=\s*(["'])https?:/i
 
