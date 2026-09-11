@@ -1017,6 +1017,10 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
       const uid = requireUid(url)
       const index = clampInt(Number(url.searchParams.get('index') ?? 0), 0, 0, 999)
       const result = await getPool().downloadAttachment(account, folder, uid, index, undefined)
+      if (url.searchParams.get('asPath') === '1') {
+        responseJson(res, 200, { ok: true, value: { path: result.path, filename: result.filename, size: result.size } })
+        return
+      }
       const data = await readFile(result.path)
       res.setHeader('Content-Type', result.contentType || 'application/octet-stream')
       res.setHeader('Content-Disposition', contentDisposition(result.filename))
@@ -3756,8 +3760,25 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         account: state.account, folder: orig.folder, uid: orig.uid, images: 1,
       });
       if (Array.isArray(v.attachments) && v.attachments.length) {
-        document.getElementById('composeAttachments').value =
-          v.attachments.map(function (a) { return (a && a.filename) ? a.filename : String(a); }).join(', ');
+        var attMsg = document.getElementById('composeMsg');
+        var attTotal = v.attachments.length;
+        attMsg.textContent = '正在获取原邮件附件…';
+        var attPaths = [];
+        var attChain = Promise.resolve();
+        v.attachments.forEach(function (a, i) {
+          attChain = attChain.then(function () {
+            return api('/api/attachment', { account: state.account, folder: orig.folder, uid: orig.uid, index: i, asPath: 1 }).then(function (r) {
+              if (r && r.path) attPaths.push(r.path);
+              attMsg.textContent = '正在获取原邮件附件（' + (i + 1) + '/' + attTotal + '）…';
+            });
+          });
+        });
+        attChain.then(function () {
+          document.getElementById('composeAttachments').value = attPaths.join(', ');
+          attMsg.textContent = '';
+        }).catch(function (err) {
+          attMsg.textContent = '附件获取失败：' + (err && err.message || err);
+        });
       }
     }).catch(function (err) {
       composeEditor.style.display = '';
