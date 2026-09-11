@@ -2787,7 +2787,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         try {
           var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
           if (!doc || !doc.body) { if (attempts < 20) pollTimer = setTimeout(trySize, 150); return; }
-          var h = Math.max(doc.body.scrollHeight, doc.documentElement ? doc.documentElement.scrollHeight : 0);
+          var h = doc.body.scrollHeight;
           if (h > 0) { frame.style.height = (h + 16) + 'px'; }
           if (attempts < 20) pollTimer = setTimeout(trySize, 300);
         } catch (e) { /* ignore */ }
@@ -3728,7 +3728,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
             try {
               var d = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
               if (!d || !d.body) return false;
-              var h = Math.max(d.body.scrollHeight, d.documentElement ? d.documentElement.scrollHeight : 0);
+              var h = d.body.scrollHeight;
               if (h > 0) frame.style.height = h + 'px';
               return true;
             } catch (e) { return false; }
