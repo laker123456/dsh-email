@@ -3650,7 +3650,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }).then(function (v) {
       btns.forEach(function (b) { b.disabled = false; b.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送'; });
       document.getElementById('composeModal').close();
-      showBanner('已发送至 ' + (v.accepted || []).join(', ') + '（' + v.messageId + '）');
+      showBanner('已发送至 ' + (v.accepted || []).join(', '));
       resetCompose();
     }).catch(function (err) {
       msg.textContent = err.message;
