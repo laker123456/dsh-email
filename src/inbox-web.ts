@@ -7,11 +7,15 @@ import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
 import { SETTINGS_NAMESPACE, validateSettingsValue, type EmailAiConversation, type EmailSettingsValue } from './settings.js'
 import { isLoopbackRequest } from './web.js'
+import { Agent, request as undiciRequest } from 'undici'
 
 // time.weoa.com uses WeBank's enterprise CA, which isn't in Node's bundled
-// cacert.pem. We rely on the host Electron app (weban-desktop) setting
-// NODE_TLS_REJECT_UNAUTHORIZED=0 for its embedded dsh process; per-source
-// undici dispatcher triggers "invalid onRequestStart method" against undici 8.
+// cacert.pem. Production relies on weban-desktop setting
+// NODE_TLS_REJECT_UNAUTHORIZED=0 for its embedded dsh process. In plain-Node
+// dev runs that env var isn't set, so route this one call through a scoped
+// undici dispatcher that skips cert verification. fetch() in undici 8 ignores
+// the dispatcher option (still throws "fetch failed"), so we use request().
+const timeDispatcher = new Agent({ connect: { rejectUnauthorized: false } })
 
 export const INBOX_ROUTE = '/_dsh/dsh-email/inbox'
 
@@ -491,12 +495,13 @@ async function handleDirSearch(req: any, res: any): Promise<void> {
     return
   }
   try {
-    const r = await fetch('https://time.weoa.com/s_itms/time/api/item/queryUserOrGroups', {
+    const r = await undiciRequest('https://time.weoa.com/s_itms/time/api/item/queryUserOrGroups', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-API-Key': auth.key!, 'OPERATOR': auth.username! },
       body: JSON.stringify({ queryKey: q }),
+      dispatcher: timeDispatcher,
     })
-    const j = await r.json() as any
+    const j = await r.body.json() as any
     if (j?.CODE !== '0') {
       responseJson(res, 502, { ok: false, error: { code: 'upstream', message: j?.MSG || ('TIME 接口返回 CODE=' + j?.CODE) } })
       return
