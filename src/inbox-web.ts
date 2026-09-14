@@ -1592,7 +1592,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       </button>
     </div>
     <ul id="messages"></ul>
-    <button id="more" type="button" style="display:none">加载更多</button>
   </div>
 
   <div class="reader">
@@ -2325,13 +2324,17 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       msgs.forEach(function (m) { listEl.appendChild(unreadRowEl(m)); });
       if (typeof value.count === 'number' && value.count > 0) setUnreadBadge(value.count);
       var shown = listEl.querySelectorAll('li[data-uid]').length;
-      var more = document.getElementById('more');
-      more.style.display = (shown >= value.count) ? 'none' : '';
+      state.hasMore = shown < value.count;
       if (had === 0 && msgs.length === 0) {
         var hint = document.createElement('li');
         hint.className = 'hint';
         hint.textContent = '没有未读邮件';
         listEl.appendChild(hint);
+      } else if (state.offset > 0 && !state.hasMore) {
+        var endHint = document.createElement('li');
+        endHint.className = 'hint';
+        endHint.textContent = '已加载全部邮件';
+        listEl.appendChild(endHint);
       }
       updateMarkSeenBtn();
     }).catch(function (err) { showBanner(err.message); });
@@ -2715,13 +2718,17 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     return api('/api/messages', params).then(function (value) {
       (value.messages || []).forEach(function (m) { listEl.appendChild(rowEl(m)); });
       var shown = listEl.children.length;
-      var more = document.getElementById('more');
-      more.style.display = (shown >= value.count) ? 'none' : '';
+      state.hasMore = shown < value.count;
       if (shown === 0) {
         var hint = document.createElement('li');
         hint.className = 'hint';
         hint.textContent = value.count === 0 ? (state.view === 'label' ? '此标签没有匹配邮件' : '此文件夹没有邮件') : '没有更多邮件';
         listEl.appendChild(hint);
+      } else if (state.offset > 0 && !state.hasMore) {
+        var endHint = document.createElement('li');
+        endHint.className = 'hint';
+        endHint.textContent = '已加载全部邮件';
+        listEl.appendChild(endHint);
       }
       updateMarkSeenBtn();
     }).catch(function (err) { showBanner(err.message); });
@@ -2766,7 +2773,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       }
       var shown = listEl.children.length;
       var more = document.getElementById('more');
-      more.style.display = (state.view === 'label' || shown >= value.count) ? 'none' : '';
+      if (more) more.style.display = (state.view === 'label' || shown >= value.count) ? 'none' : '';
       if (shown === 0) {
         var h = document.createElement('li');
         h.className = 'hint';
@@ -3125,11 +3132,25 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (document.getElementById('loginView') && document.getElementById('loginView').classList.contains('active')) return;
     silentRefresh();
   }, 60000);
-  document.getElementById('more').onclick = function () {
-    state.offset += state.limit;
-    if (state.view === 'unread') loadUnreadList();
-    else loadList();
-  };
+  (function () {
+    var messages = document.getElementById('messages');
+    if (!messages) return;
+    var loadingMore = false;
+    var onScroll = function () {
+      if (loadingMore) return;
+      if (state.view === 'label') return;
+      if (state.hasMore === false) return;
+      var remaining = messages.scrollHeight - messages.scrollTop - messages.clientHeight;
+      if (remaining > 200) return;
+      loadingMore = true;
+      state.offset += state.limit;
+      var done = function () { loadingMore = false; };
+      if (state.view === 'unread') loadUnreadList().then(done, done);
+      else loadList().then(done, done);
+    };
+    messages.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+  })();
   document.getElementById('addLabelBtn').onclick = function () {
     openLabelModal(null);
   };
