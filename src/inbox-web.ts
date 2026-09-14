@@ -2903,8 +2903,35 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       attach.innerHTML = '';
       (v.attachments || []).forEach(function (a, i) {
         var link = document.createElement('a');
-        link.href = BASE + '/api/attachment' + qs({ account: state.account, folder: effFolder, uid: uid, index: i });
+        var href = BASE + '/api/attachment' + qs({ account: state.account, folder: effFolder, uid: uid, index: i });
+        link.href = href;
+        link.download = a.filename || '';
         link.innerHTML = '<i class="fa-solid fa-file"></i> ' + esc(a.filename) + '（' + fmtSize(a.size) + '）';
+        link.onclick = function (ev) {
+          ev.preventDefault();
+          fetch(href).then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.blob();
+          }).then(function (blob) {
+            if (window.showSaveFilePicker) {
+              return window.showSaveFilePicker({ suggestedName: a.filename || 'attachment' })
+                .then(function (handle) { return handle.createWritable(); })
+                .then(function (writable) { return writable.write(blob).then(function () { return writable.close(); }); });
+            }
+            var url = URL.createObjectURL(blob);
+            var tmp = document.createElement('a');
+            tmp.href = url;
+            tmp.download = a.filename || '';
+            tmp.target = '_self';
+            tmp.style.display = 'none';
+            document.body.appendChild(tmp);
+            tmp.click();
+            setTimeout(function () { tmp.remove(); URL.revokeObjectURL(url); }, 1000);
+          }).catch(function (err) {
+            if (err && err.name === 'AbortError') return;
+            showBanner('下载失败：' + (err && err.message || err));
+          });
+        };
         attach.appendChild(link);
       });
       attach.style.display = (v.attachments && v.attachments.length > 0) ? '' : 'none';
