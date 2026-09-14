@@ -2904,21 +2904,52 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       (v.attachments || []).forEach(function (a, i) {
         var link = document.createElement('a');
         var href = BASE + '/api/attachment' + qs({ account: state.account, folder: effFolder, uid: uid, index: i });
-        link.href = href;
-        link.download = a.filename || '';
+        link.href = 'javascript:void(0)';
+        link.style.cursor = 'pointer';
         link.innerHTML = '<i class="fa-solid fa-file"></i> ' + esc(a.filename) + '（' + fmtSize(a.size) + '）';
         link.onclick = function (ev) {
           ev.preventDefault();
+          var progressId = 'dlProgress_' + i;
+          var existing = document.getElementById(progressId);
+          if (existing) existing.remove();
+          var progressEl = document.createElement('div');
+          progressEl.id = progressId;
+          progressEl.style.cssText = 'margin:6px 0 2px;font-size:12px;color:#3b7bff;';
+          progressEl.textContent = '下载 ' + (a.filename || '附件') + '… 0%';
+          attach.appendChild(progressEl);
+          var fmtMB = function (n) {
+            return n < 1024 * 1024 ? (n / 1024).toFixed(0) + ' KB'
+              : (n / 1024 / 1024).toFixed(2) + ' MB';
+          };
+          var updateProgress = function (loaded, total) {
+            var pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
+            progressEl.textContent = '下载 ' + (a.filename || '附件') + '… ' + pct + '% (' + fmtMB(loaded) + ' / ' + fmtMB(total) + ')';
+          };
           fetch(href).then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.blob();
-          }).then(function (blob) {
+            var total = Number(r.headers.get('content-length')) || a.size || 0;
+            if (!r.body || typeof r.body.getReader !== 'function') return r.blob().then(function (blob) { return { blob: blob, total: total || blob.size }; });
+            var reader = r.body.getReader();
+            var chunks = [];
+            var loaded = 0;
+            function read() {
+              return reader.read().then(function (res) {
+                if (res.done) return { blob: new Blob(chunks), total: total || loaded };
+                chunks.push(res.value);
+                loaded += res.value.byteLength;
+                updateProgress(loaded, total || loaded);
+                return read();
+              });
+            }
+            return read();
+          }).then(function (data) {
+            progressEl.textContent = '下载 ' + (a.filename || '附件') + '… 已完成，准备保存';
             if (window.showSaveFilePicker) {
               return window.showSaveFilePicker({ suggestedName: a.filename || 'attachment' })
                 .then(function (handle) { return handle.createWritable(); })
-                .then(function (writable) { return writable.write(blob).then(function () { return writable.close(); }); });
+                .then(function (writable) { return writable.write(data.blob).then(function () { return writable.close(); }); });
             }
-            var url = URL.createObjectURL(blob);
+            var url = URL.createObjectURL(data.blob);
             var tmp = document.createElement('a');
             tmp.href = url;
             tmp.download = a.filename || '';
@@ -2927,9 +2958,14 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
             document.body.appendChild(tmp);
             tmp.click();
             setTimeout(function () { tmp.remove(); URL.revokeObjectURL(url); }, 1000);
+          }).then(function () {
+            progressEl.textContent = '已保存 ' + (a.filename || '附件');
+            setTimeout(function () { if (progressEl.parentNode) progressEl.remove(); }, 3000);
           }).catch(function (err) {
-            if (err && err.name === 'AbortError') return;
-            showBanner('下载失败：' + (err && err.message || err));
+            if (err && err.name === 'AbortError') { progressEl.remove(); return; }
+            progressEl.textContent = '下载失败：' + (err && err.message || err);
+            progressEl.style.color = '#cf222e';
+            setTimeout(function () { if (progressEl.parentNode) progressEl.remove(); }, 5000);
           });
         };
         attach.appendChild(link);
