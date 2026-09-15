@@ -94,6 +94,9 @@ test('inbox page is served as no-store HTML', async () => {
   assert.equal(res.headers['x-content-type-options'], 'nosniff')
   assert.ok(res.body().includes('收件箱'))
   assert.ok(res.body().includes(INBOX_ROUTE))
+  const inlineScript = res.body().match(/<script>([\s\S]*?)<\/script>/)
+  assert.ok(inlineScript)
+  assert.doesNotThrow(() => new Function(inlineScript[1]))
 })
 
 test('inbox rejects non-GET methods with 405', async () => {
