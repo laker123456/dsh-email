@@ -2043,7 +2043,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var known = folders.some(function (f) { return f.path === state.folder; });
       if (!known) {
         var inbox = folders.filter(function (f) {
-          return f.specialUse === '\\Inbox' || String(f.path).toUpperCase() === 'INBOX';
+          return f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX';
         })[0];
         state.folder = (inbox || folders[0] || { path: '' }).path;
       }
@@ -2141,11 +2141,11 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         };
         nav.appendChild(btn);
         if (f.unread > 0) unreadTotal += f.unread;
-        if (f.specialUse === '\\Inbox' || String(f.path).toUpperCase() === 'INBOX') {
+        if (f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX') {
           nav.appendChild(unreadBtn);
           unreadInserted = true;
         }
-        if (trashIdx < 0 && (f.specialUse === '\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
+        if (trashIdx < 0 && (f.specialUse === '\\\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
       });
       if (!unreadInserted) nav.insertBefore(unreadBtn, nav.firstChild);
       setUnreadBadge(unreadTotal);
