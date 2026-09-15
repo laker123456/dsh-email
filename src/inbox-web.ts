@@ -1134,6 +1134,24 @@ button, select, input { font: inherit; }
 .menu-item-left i { width: 16px; text-align: center; color: #666; flex-shrink: 0; }
 .menu-item.active .menu-item-left i { color: #e0a37a; }
 .menu-item-left span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.menu-empty {
+  margin: 6px 10px 8px; padding: 10px 12px;
+  border: 1px dashed #d6dde6; border-radius: 6px;
+  color: #6a7384; font-size: 12px; line-height: 1.6;
+  background: #fafbfc;
+}
+.menu-empty .empty-title { color: #4a5566; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+.menu-empty .empty-title i { color: #c5cdd8; }
+.menu-empty .empty-hint { color: #8a97a8; font-size: 11px; margin-bottom: 8px; }
+.menu-empty .empty-reload {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 10px; border-radius: 4px;
+  border: 1px solid #d6dde6; background: #fff; color: #4a5566;
+  font-size: 12px; cursor: pointer;
+}
+.menu-empty .empty-reload:hover { background: #f4f6f9; border-color: #b8c2cc; color: #2a3340; }
+.menu-empty .empty-reload:disabled { opacity: .6; cursor: default; }
+.menu-empty .empty-reload i { font-size: 11px; }
 .count-badge { font-size: 11px; color: #e0a37a; font-weight: bold; flex-shrink: 0; }
 .folder-chip { font-size: 11px; color: #66788f; background: #fdf5e2; border-radius: 4px; padding: 0 6px; flex-shrink: 0; max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .unread-dot { width: 6px; height: 6px; background: #d97a4e; border-radius: 50%; flex-shrink: 0; display: inline-block; }
@@ -1957,15 +1975,20 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     });
   }
   var bannerTimer = null;
-  function showBanner(msg) {
+  function showBanner(msg, opts) {
+    var durationMs = (opts && typeof opts.durationMs === 'number') ? opts.durationMs : 3000;
     var b = document.getElementById('banner');
     b.textContent = msg;
     b.style.display = 'block';
     if (bannerTimer) clearTimeout(bannerTimer);
-    bannerTimer = setTimeout(function () {
-      b.style.display = 'none';
+    if (durationMs > 0) {
+      bannerTimer = setTimeout(function () {
+        b.style.display = 'none';
+        bannerTimer = null;
+      }, durationMs);
+    } else {
       bannerTimer = null;
-    }, 3000);
+    }
   }
 
   function confirmDialog(opts) {
@@ -2020,12 +2043,36 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var known = folders.some(function (f) { return f.path === state.folder; });
       if (!known) {
         var inbox = folders.filter(function (f) {
-          return f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX';
+          return f.specialUse === '\\Inbox' || String(f.path).toUpperCase() === 'INBOX';
         })[0];
         state.folder = (inbox || folders[0] || { path: '' }).path;
       }
       var nav = document.getElementById('folders');
       nav.innerHTML = '';
+      if (folders.length === 0) {
+        var empty = document.createElement('div');
+        empty.className = 'menu-empty';
+        var eTitle = document.createElement('div');
+        eTitle.className = 'empty-title';
+        eTitle.innerHTML = '<i class="fa-regular fa-folder-open"></i><span>无可用文件夹</span>';
+        var eHint = document.createElement('div');
+        eHint.className = 'empty-hint';
+        eHint.textContent = 'IMAP 列表为空，请检查账户订阅或网络。';
+        var eBtn = document.createElement('button');
+        eBtn.type = 'button';
+        eBtn.className = 'empty-reload';
+        eBtn.innerHTML = '<i class="fa-solid fa-rotate-right"></i> 重新拉取';
+        eBtn.onclick = function () {
+          var self = eBtn;
+          self.disabled = true;
+          self.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 拉取中…';
+          loadFolders().then(function () { self.disabled = false; self.innerHTML = '<i class="fa-solid fa-rotate-right"></i> 重新拉取'; });
+        };
+        empty.appendChild(eTitle);
+        empty.appendChild(eHint);
+        empty.appendChild(eBtn);
+        nav.appendChild(empty);
+      }
       var trashIdx = -1;
       var unreadBtn = document.createElement('button');
       unreadBtn.type = 'button';
@@ -2094,11 +2141,11 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         };
         nav.appendChild(btn);
         if (f.unread > 0) unreadTotal += f.unread;
-        if (f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX') {
+        if (f.specialUse === '\\Inbox' || String(f.path).toUpperCase() === 'INBOX') {
           nav.appendChild(unreadBtn);
           unreadInserted = true;
         }
-        if (trashIdx < 0 && (f.specialUse === '\\\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
+        if (trashIdx < 0 && (f.specialUse === '\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
       });
       if (!unreadInserted) nav.insertBefore(unreadBtn, nav.firstChild);
       setUnreadBadge(unreadTotal);
@@ -2382,6 +2429,25 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       state.labels = labels;
       var nav = document.getElementById('labels');
       nav.innerHTML = '';
+      if (labels.length === 0) {
+        var empty = document.createElement('div');
+        empty.className = 'menu-empty';
+        var eTitle = document.createElement('div');
+        eTitle.className = 'empty-title';
+        eTitle.innerHTML = '<i class="fa-regular fa-tag"></i><span>暂无标签</span>';
+        var eHint = document.createElement('div');
+        eHint.className = 'empty-hint';
+        eHint.textContent = '可按主题或发件人自动归类。';
+        var eBtn = document.createElement('button');
+        eBtn.type = 'button';
+        eBtn.className = 'empty-reload';
+        eBtn.innerHTML = '<i class="fa-solid fa-plus"></i> 新建标签';
+        eBtn.onclick = function () { openLabelModal(null); };
+        empty.appendChild(eTitle);
+        empty.appendChild(eHint);
+        empty.appendChild(eBtn);
+        nav.appendChild(empty);
+      }
       labels.forEach(function (l) {
         var btn = document.createElement('button');
         btn.type = 'button';
@@ -4085,7 +4151,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       showLogin();
     } else {
       showMain();
-      showBanner(msg);
+      showBanner('加载文件夹失败：' + msg + '（请重试或检查 IMAP 连接）', { durationMs: 0 });
     }
   });
 })();
