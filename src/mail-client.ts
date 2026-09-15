@@ -1,7 +1,7 @@
 import { ImapFlow } from 'imapflow'
 import nodemailer, { type Transporter } from 'nodemailer'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { Readable } from 'node:stream'
 import type { ResolvedEmailConfig, ResolvedEmailSettings } from './config.js'
 import type { EmailLabelCondition } from './settings.js'
@@ -77,12 +77,25 @@ export function selectAttachmentPart(
 ): AttachmentPart | undefined {
   const meta = readAttachments[index]
   if (meta === undefined) return undefined
-  const byName = parts.find(part => part.filename === meta.filename || sanitizeFilename(part.filename) === meta.filename)
-  if (byName !== undefined) return byName
+  // 1) filename match (case-sensitive, then sanitized). If meta.filename is
+  //    empty/blank, skip name matching — IMAP bodyStructure synthesizes
+  //    `part-X.Y` for missing filenames, which can never match an empty
+  //    meta, so the comparison would always miss and lead to a 400.
+  if (meta.filename.trim() !== '') {
+    const byName = parts.find(part => part.filename === meta.filename || sanitizeFilename(part.filename) === meta.filename)
+    if (byName !== undefined) return byName
+  }
+  // 2) tolerant content-type + size match
   const tolerance = Math.max(64, Math.ceil(meta.size * 0.5))
   const byTypeAndSize = parts.find(part =>
     part.contentType === meta.contentType && Math.abs(part.size - meta.size) <= tolerance)
-  return byTypeAndSize
+  if (byTypeAndSize !== undefined) return byTypeAndSize
+  // 3) same-content-type match (size tolerance can be tight on misreported sizes)
+  const byType = parts.find(part => part.contentType === meta.contentType)
+  if (byType !== undefined) return byType
+  // 4) last resort: positional — assume body.attachments and parts[] are in
+  //    the same DFS order when the email has no filename metadata at all.
+  return parts[index]
 }
 
 /** Case-insensitive match of a query against subject/from/body text. */
@@ -835,7 +848,7 @@ export class EmailPool {
       to,
       subject,
       text: text ?? '',
-      attachments,
+      attachments: attachments.map(function (a) { return { path: a.path, filename: a.filename } }),
     }
     if (cc) opts.cc = cc
     if (bcc) opts.bcc = bcc
@@ -852,8 +865,8 @@ export class EmailPool {
 }
 
 /** Stat every attachment path up front; total size must stay under the cap. */
-export async function validateAttachmentPaths(paths: string[], maxBytes: number): Promise<Array<{ path: string }>> {
-  const out: Array<{ path: string }> = []
+export async function validateAttachmentPaths(paths: string[], maxBytes: number): Promise<Array<{ path: string; filename: string }>> {
+  const out: Array<{ path: string; filename: string }> = []
   let total = 0
   for (const rawPath of paths) {
       if (typeof rawPath !== 'string' || rawPath.trim() === '') {
@@ -869,7 +882,7 @@ export async function validateAttachmentPaths(paths: string[], maxBytes: number)
     if (total > maxBytes) {
       throw new MailError('附件总大小超过上限 maxAttachmentBytes=' + maxBytes + ' 字节')
     }
-    out.push({ path })
+    out.push({ path, filename: basename(path) })
   }
   return out
 }

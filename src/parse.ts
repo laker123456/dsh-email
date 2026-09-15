@@ -81,7 +81,7 @@ export async function parseRawMessage(source: Buffer, maxBodyChars: number): Pro
     ? { text: rawHtml.slice(0, maxBodyChars), truncated: true }
     : { text: rawHtml, truncated: false }
   const attachments: EmailAttachmentMeta[] = (parsed.attachments ?? []).map((att, index) => ({
-    filename: att.filename ?? '(unnamed)',
+    filename: typeof att.filename === 'string' ? att.filename : '',
     contentType: att.contentType,
     size: att.size,
     part: 'attachment-' + index,
@@ -149,7 +149,7 @@ export async function parseHtmlMessage(source: Buffer, maxInlineImageBytes: numb
     text: parsed.text ?? '',
     hasRemoteImages: html !== '' && REMOTE_IMG_RE.test(html),
     attachments: (parsed.attachments ?? []).map((att, index) => ({
-      filename: att.filename ?? '(unnamed)',
+      filename: typeof att.filename === 'string' ? att.filename : '',
       contentType: att.contentType,
       size: att.size,
       part: 'attachment-' + index,

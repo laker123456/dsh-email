@@ -1182,6 +1182,7 @@ button, select, input { font: inherit; }
 }
 .reader-toolbar .left button:hover { background: #e6e9f0; }
 .reader-toolbar .left button:disabled { opacity: .5; cursor: default; }
+.reader-toolbar .left .tb-sep { width: 1px; height: 18px; background: #e8ecef; margin: 0 2px; }
 .reader-toolbar .right { font-size: 12px; color: #8a97a8; }
 
 #readerHead { padding: 16px 24px; border-bottom: 1px solid #f0f0f0; flex-shrink: 0; }
@@ -1199,7 +1200,7 @@ button, select, input { font: inherit; }
 #readerHead .kv { color: #888; }
 #placeholder { color: #8a97a8; padding: 40px; text-align: center; }
 #frame { border: none; width: 100%; background: #fff; min-height: 200px; flex-shrink: 0; }
-#attach { padding: 10px 24px; background: #fff; border-top: 1px solid #f0f0f0; font-size: 12px; flex-shrink: 0; }
+#attach { padding: 10px 24px; background: #fff; border-bottom: 1px solid #f0f0f0; font-size: 12px; flex-shrink: 0; }
 #attach a { color: #e0a37a; text-decoration: none; margin-right: 14px; display: inline-flex; align-items: center; gap: 4px; }
 #attach a:hover { text-decoration: underline; }
 
@@ -1294,54 +1295,61 @@ dialog#labelModal {
   width: 420px; max-width: 95vw; max-height: 90vh; overflow: auto;
   margin: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.12); color: #333;
 }
-dialog#composeModal {
-  border: 1px solid #e1e6ed; border-radius: 8px; padding: 0;
-  width: 100vw; max-width: 100vw; height: 100vh; max-height: 100vh;
-  border-radius: 0; overflow: auto;
-  margin: 0; box-shadow: 0 4px 24px rgba(0,0,0,0.16); color: #333;
-  display: none;
+#composeModal {
+  border: 1px solid #e1e6ed; border-radius: 0; padding: 0;
+  margin: 0; color: #333; background: #fff;
+  display: flex; flex-direction: column;
+  position: fixed;
+  top: 52px;
+  right: 0;
+  bottom: 0;
+  left: 210px;
+  width: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  z-index: 100;
 }
-dialog#composeModal[open] { display: flex; flex-direction: column; }
-dialog#composeModal .compose-body { padding: 12px 20px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
-dialog#composeModal::backdrop { background: rgba(0,0,0,0.35); }
-dialog#composeModal .compose-topbar {
+#composeModal[hidden] { display: none; }
+#composeModal .compose-body { padding: 12px 20px; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+#composeModal .compose-topbar {
   display: flex; justify-content: space-between; align-items: center;
   padding: 10px 16px; border-bottom: 1px solid #eee;
 }
-dialog#composeModal .compose-topbar .actions { display: flex; gap: 6px; }
-dialog#composeModal .btn-c {
+#composeModal .compose-topbar .actions { display: flex; gap: 6px; }
+#composeModal .btn-c {
   padding: 4px 12px; border-radius: 3px; border: 1px solid #d9d9d9;
   background: #fff; cursor: pointer; font-size: 12px; color: #333;
 }
-dialog#composeModal .btn-c.primary { background: #3b7bff; color: #fff; border-color: #3b7bff; }
-dialog#composeModal .btn-c.primary:hover { background: #2a69ea; }
-dialog#composeModal .topbar-right { display: flex; gap: 14px; align-items: center; color: #666; font-size: 12px; }
-dialog#composeModal .topbar-right span { cursor: pointer; }
-dialog#composeModal .form-row {
+#composeModal .btn-c.primary { background: #3b7bff; color: #fff; border-color: #3b7bff; }
+#composeModal .btn-c.primary:hover { background: #2a69ea; }
+#composeModal .topbar-right { display: flex; gap: 14px; align-items: center; color: #666; font-size: 12px; }
+#composeModal .topbar-right span { cursor: pointer; }
+#composeModal .form-row {
   display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0;
 }
-dialog#composeModal .form-label { width: 60px; color: #666; font-size: 12px; }
-dialog#composeModal .form-input {
+#composeModal .form-label { width: 60px; color: #666; font-size: 12px; }
+#composeModal .form-input {
   flex: 1; border: none; outline: none; font-size: 13px; padding: 2px 0; background: transparent;
 }
-dialog#composeModal .placeholder-tip { color: #aaa; font-size: 11px; margin-left: 8px; }
-dialog#composeModal .recipient-container {
+#composeModal .placeholder-tip { color: #aaa; font-size: 11px; margin-left: 8px; }
+#composeModal .recipient-container {
   flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
   padding: 2px 0;
 }
-dialog#composeModal .recipient-input { flex: 1; min-width: 80px; border: none; outline: none; font-size: 13px; padding: 2px 0; background: transparent; }
-dialog#composeModal .recipient-tag {
+#composeModal .recipient-input { flex: 1; min-width: 80px; border: none; outline: none; font-size: 13px; padding: 2px 0; background: transparent; }
+#composeModal .recipient-tag {
   display: inline-flex; align-items: center; background: #f0f4ff;
   border: 1px solid #c5d8f5; border-radius: 12px; padding: 2px 4px 2px 8px;
   font-size: 12px; color: #1a4b8c; gap: 4px;
 }
-dialog#composeModal .recipient-tag.invalid {
+#composeModal .recipient-tag.invalid {
   background: #fff0f0; border-color: #f5c2c2; color: #cf222e;
 }
-dialog#composeModal .recipient-tag .close-btn { cursor: pointer; color: #7a9bc7; font-weight: bold; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
-dialog#composeModal .recipient-tag .close-btn:hover { color: #fff; background: #5a7fb5; }
-dialog#composeModal .recipient-tag.invalid .close-btn { color: #cf222e; }
-dialog#composeModal .recipient-tag.invalid .close-btn:hover { color: #fff; background: #cf222e; }
+#composeModal .recipient-tag .close-btn { cursor: pointer; color: #7a9bc7; font-weight: bold; width: 14px; height: 14px; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; }
+#composeModal .recipient-tag .close-btn:hover { color: #fff; background: #5a7fb5; }
+#composeModal .recipient-tag.invalid .close-btn { color: #cf222e; }
+#composeModal .recipient-tag.invalid .close-btn:hover { color: #fff; background: #cf222e; }
 #acBox {
   position: fixed; z-index: 9999;
   background: #fff; border: 1px solid #d0d7de; border-radius: 4px;
@@ -1354,84 +1362,84 @@ dialog#composeModal .recipient-tag.invalid .close-btn:hover { color: #fff; backg
 #acBox .ac-item .ac-name { color: #333; }
 #acBox .ac-item .ac-mail { color: #888; margin-left: 6px; font-size: 11px; }
 #acBox .ac-hint { padding: 6px 10px; color: #aaa; font-size: 11px; }
-dialog#composeModal .sub-tools {
+#composeModal .sub-tools {
   display: flex; align-items: center; gap: 14px; padding: 8px 0; color: #666; font-size: 12px;
 }
-dialog#composeModal .sub-tools .divider { width: 1px; height: 12px; background: #e8e8e8; }
-dialog#composeModal .editor-container {
+#composeModal .sub-tools .divider { width: 1px; height: 12px; background: #e8e8e8; }
+#composeModal .editor-container {
   border: 1px solid #e8e8e8; border-radius: 4px; margin-top: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.02);
   flex: 1; min-height: 0; display: flex; flex-direction: column;
 }
-dialog#composeModal .editor-toolbar {
+#composeModal .editor-toolbar {
   display: flex; align-items: center; gap: 4px;
   padding: 6px 8px; background: #fafafa; border-bottom: 1px solid #e8e8e8; font-size: 13px;
   border-radius: 6px 6px 0 0; overflow-x: auto;
 }
-dialog#composeModal .tb-item {
+#composeModal .tb-item {
   cursor: pointer; padding: 3px 5px; border-radius: 3px; display: inline-flex;
   align-items: center; gap: 2px; color: #555; user-select: none;
 }
-dialog#composeModal .tb-item:hover { background: #ececec; }
-dialog#composeModal .tb-item.active { background: #fdf5e2; color: #e0a37a; }
-dialog#composeModal .tb-select {
+#composeModal .tb-item:hover { background: #ececec; }
+#composeModal .tb-item.active { background: #fdf5e2; color: #e0a37a; }
+#composeModal .tb-select {
   border: 1px solid #d9d9d9; border-radius: 2px; padding: 2px 4px; background: #fff; font-size: 12px; outline: none;
 }
-dialog#composeModal .tool-btn {
+#composeModal .tool-btn {
   display: inline-flex; align-items: center; justify-content: center;
   height: 28px; min-width: 28px; padding: 0 6px; border-radius: 4px;
   cursor: pointer; color: #444; font-size: 14px; user-select: none;
   border: 1px solid transparent; transition: background .12s, border-color .12s;
 }
-dialog#composeModal .tool-btn:hover { background: #eef1f5; border-color: #dde2e8; }
-dialog#composeModal .tool-btn.active { background: #fdf5e2; color: #e0a37a; border-color: #eebd8d; }
-dialog#composeModal .tool-btn .fa-solid { font-size: 13px; }
-dialog#composeModal .tool-select {
+#composeModal .tool-btn:hover { background: #eef1f5; border-color: #dde2e8; }
+#composeModal .tool-btn.active { background: #fdf5e2; color: #e0a37a; border-color: #eebd8d; }
+#composeModal .tool-btn .fa-solid { font-size: 13px; }
+#composeModal .tool-select {
   height: 26px; border: 1px solid #d0d0d0; background: #fff;
   border-radius: 4px; padding: 0 6px; font-size: 12px; color: #333; outline: none; cursor: pointer;
 }
-dialog#composeModal .tool-select:hover { border-color: #b8c2cc; }
-dialog#composeModal .tb-divider { width: 1px; height: 18px; background: #e2e6eb; margin: 0 2px; }
-dialog#composeModal .color-pick {
+#composeModal .tool-select:hover { border-color: #b8c2cc; }
+#composeModal .tb-divider { width: 1px; height: 18px; background: #e2e6eb; margin: 0 2px; }
+#composeModal .color-pick {
   display: inline-flex; align-items: center; gap: 2px; height: 28px; padding: 0 4px;
   border-radius: 4px; border: 1px solid transparent; cursor: pointer; color: #444; user-select: none;
   position: relative;
 }
-dialog#composeModal .color-pick:hover { background: #eef1f5; border-color: #dde2e8; }
-dialog#composeModal .color-pick-icon { display: inline-flex; flex-direction: column; align-items: center; line-height: 1; font-size: 13px; }
-dialog#composeModal .color-pick-bar { width: 14px; height: 3px; margin-top: 2px; background: #333; }
-dialog#composeModal .color-pick-arrow { font-size: 10px; color: #999; margin-left: 1px; }
-dialog#composeModal .color-palette {
+#composeModal .color-pick:hover { background: #eef1f5; border-color: #dde2e8; }
+#composeModal .color-pick-icon { display: inline-flex; flex-direction: column; align-items: center; line-height: 1; font-size: 13px; }
+#composeModal .color-pick-bar { width: 14px; height: 3px; margin-top: 2px; background: #333; }
+#composeModal .color-pick-arrow { font-size: 10px; color: #999; margin-left: 1px; }
+#composeModal .color-palette {
   position: absolute; display: none; z-index: 50; top: 64px; left: 8px;
   background: #fff; border: 1px solid #d0d4d9; border-radius: 6px; box-shadow: 0 4px 14px rgba(0,0,0,.15);
   padding: 8px; font-size: 12px;
 }
-dialog#composeModal .palette-grid {
+#composeModal .palette-grid {
   display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; max-width: 220px;
 }
-dialog#composeModal .palette-grid .swatch-cell {
+#composeModal .palette-grid .swatch-cell {
   width: 18px; height: 18px; border-radius: 3px; border: 1px solid #d0d0d0; cursor: pointer;
   transition: transform .1s;
 }
-dialog#composeModal .palette-row .swatch-cell:hover { transform: scale(1.15); border-color: #3b7bff; }
-dialog#composeModal .palette-custom { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid #eee; }
-dialog#composeModal .palette-custom input[type=color] { width: 24px; height: 24px; padding: 0; border: 1px solid #d0d0d0; border-radius: 3px; cursor: pointer; background: #fff; }
-dialog#composeModal .editor-content {
+#composeModal .palette-row .swatch-cell:hover { transform: scale(1.15); border-color: #3b7bff; }
+#composeModal .palette-custom { display: flex; align-items: center; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid #eee; }
+#composeModal .palette-custom input[type=color] { width: 24px; height: 24px; padding: 0; border: 1px solid #d0d0d0; border-radius: 3px; cursor: pointer; background: #fff; }
+#composeModal .editor-content {
   flex: none; min-height: 400px; padding: 16px 20px; outline: none; overflow: visible;
   font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   color: #222; background: #fff;
 }
-dialog#composeModal .editor-content img { max-width: 100%; height: auto; }
-dialog#composeModal .editor-content table { max-width: 100%; }
-dialog#composeModal .editor-content:empty::before {
+#composeModal .editor-content img { max-width: 100%; height: auto; }
+#composeModal .editor-content table { max-width: 100%; }
+#composeModal .editor-content:empty::before {
   content: attr(data-placeholder); color: #b0b6bf; pointer-events: none;
 }
-dialog#composeModal .compose-footer {
+#composeModal .compose-footer {
   display: flex; align-items: center; gap: 12px; margin-top: 10px; color: #666; font-size: 12px;
 }
-dialog#composeModal .compose-footer .from-info { color: #666; }
-dialog#composeModal .compose-footer .from-info strong { color: #333; }
-dialog#composeModal .compose-footer .footer-actions { margin-left: auto; display: flex; gap: 8px; }
-dialog#composeModal #composeMsg { color: #cf222e; font-size: 12px; min-height: 14px; margin-top: 6px; }
+#composeModal .compose-footer .from-info { color: #666; }
+#composeModal .compose-footer .from-info strong { color: #333; }
+#composeModal .compose-footer .footer-actions { margin-left: auto; display: flex; gap: 8px; }
+#composeModal #composeMsg { color: #cf222e; font-size: 12px; min-height: 14px; margin-top: 6px; }
 #imgToolbar {
   position: absolute; display: none; z-index: 9999;
   background: rgba(33,33,33,0.9); color: #fff; border-radius: 4px;
@@ -1600,6 +1608,10 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         <button type="button" id="zoomOut" title="缩小"><i class="fa-solid fa-minus"></i></button>
         <span id="zoomPct" style="min-width:42px; text-align:center; cursor:pointer" title="点击还原 100%">100%</span>
         <button type="button" id="zoomIn" title="放大"><i class="fa-solid fa-plus"></i></button>
+        <span class="tb-sep"></span>
+        <button type="button" id="detailReply" title="回复邮件" disabled><i class="fa-solid fa-reply"></i> 回复</button>
+        <button type="button" id="detailForward" title="转发邮件" disabled><i class="fa-solid fa-share"></i> 转发</button>
+        <button type="button" id="detailToggleSeen" title="标记已读/未读" disabled><i class="fa-solid fa-envelope-open"></i> <span id="detailSeenLabel">设为已读</span></button>
       </div>
       <div class="right" id="readerMeta"></div>
     </div>
@@ -1608,8 +1620,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         <i class="fa-solid fa-circle-notch fa-spin" style="font-size:24px; color:#3b7bff;"></i>
       </div>
       <div id="readerHead"><div id="placeholder"><i class="fa-regular fa-envelope-open" style="font-size:32px; color:#d0d7de"></i><div style="margin-top:8px">在左侧选择一封邮件阅读</div></div></div>
-      <iframe id="frame" referrerpolicy="no-referrer" title="邮件正文"></iframe>
       <div id="attach" style="display:none"></div>
+      <iframe id="frame" referrerpolicy="no-referrer" title="邮件正文"></iframe>
     </div>
   </div>
 
@@ -1653,9 +1665,9 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   </div>
 </dialog>
 
-<dialog id="composeModal">
+<div id="composeModal" hidden>
 <div id="acBox"></div>
-  <form id="composeForm" method="dialog">
+  <form id="composeForm">
     <div class="compose-topbar">
       <div class="actions">
         <button type="button" class="btn-c primary" id="composeSend"><i class="fa-solid fa-paper-plane"></i> 发送</button>
@@ -1832,19 +1844,31 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       <div id="composeMsg"></div>
     </div>
   </form>
-</dialog>
+</div>
 
 <script>
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
   var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [], zoom: 1 };
+  var currentMsg = null;
   var LABEL_COLORS = ['#e0a37a', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
+  }
+  function safeAttName(raw) {
+    var name = String(raw == null ? '' : raw).replace(/\\/g, '/').split('/').pop() || '';
+    name = name.replace(/[ -]/g, '').replace(/[<>:"|?*]/g, '_').trim().replace(/[. ]+$/g, '');
+    if (name === '' || name === '.' || name === '..' || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = 'attachment.bin';
+    if (name.length > 120) {
+      var dot = name.lastIndexOf('.');
+      var ext = dot > 0 && dot >= name.length - 12 ? name.slice(dot) : '';
+      name = name.slice(0, 120 - ext.length) + ext;
+    }
+    return name;
   }
   function fmtSize(n) {
     if (n > 1048576) return (n / 1048576).toFixed(1) + ' MB';
@@ -2735,7 +2759,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   }
   function silentRefresh() {
     if (state.offset !== 0) return Promise.resolve();
-    if (state.view === 'unread' || state.view === 'todo') return Promise.resolve();
+    if (state.view === 'unread' || state.view === 'todo' || state.view === 'search') return Promise.resolve();
     var params = state.view === 'label'
       ? { account: state.account, label: state.labelId, limit: state.limit, offset: state.offset }
       : { account: state.account, folder: state.folder, limit: state.limit, unreadOnly: state.unreadOnly };
@@ -2851,6 +2875,47 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     else if (e.key === '0') { state.zoom = 1; applyZoom(); e.preventDefault(); }
   });
 
+  function setDetailActionsEnabled(on) {
+    ['detailReply', 'detailForward', 'detailToggleSeen'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.disabled = !on;
+    });
+  }
+  function updateDetailSeenLabel() {
+    var label = document.getElementById('detailSeenLabel');
+    if (!label || !currentMsg) return;
+    label.textContent = currentMsg.seen ? '设为未读' : '设为已读';
+  }
+  document.getElementById('detailReply').onclick = function () {
+    if (!currentMsg) return;
+    startReply(currentMsg);
+  };
+  document.getElementById('detailForward').onclick = function () {
+    if (!currentMsg) return;
+    startForward(currentMsg);
+  };
+  document.getElementById('detailToggleSeen').onclick = function () {
+    if (!currentMsg) return;
+    var targetSeen = !currentMsg.seen;
+    fetch(BASE + '/api/toggle-seen', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account: state.account, folder: currentMsg.folder, uid: currentMsg.uid, on: targetSeen }),
+    }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+      if (d && d.ok) {
+        currentMsg.seen = targetSeen;
+        updateDetailSeenLabel();
+        var li = document.querySelector('#messages li[data-uid="' + currentMsg.uid + '"]');
+        if (li) {
+          li.classList.toggle('unread', !currentMsg.seen);
+          li.dataset.seen = currentMsg.seen ? '1' : '0';
+        }
+      } else {
+        showBanner((d && d.error && d.error.message) || '切换失败');
+      }
+    });
+  };
+
   function openMessage(uid, folder) {
     var effFolder = folder || state.folder;
     state.uid = uid;
@@ -2906,14 +2971,28 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
             '<div class="recipient-line">收件人：' + esc(to) + (cc ? ' · 抄送：' + esc(cc) : '') + '</div>' +
           '</div>' +
         '</div>';
+      currentMsg = {
+        uid: uid,
+        folder: effFolder,
+        subject: v.subject || '',
+        from: fromName + (fromParsed.address ? ' <' + fromParsed.address + '>' : ''),
+        to: to,
+        cc: cc,
+        date: v.date || '',
+        seen: true,
+      };
+      setDetailActionsEnabled(true);
+      updateDetailSeenLabel();
       var attach = document.getElementById('attach');
       attach.innerHTML = '';
       (v.attachments || []).forEach(function (a, i) {
+        var displayName = safeAttName(a.filename);
         var link = document.createElement('a');
         var href = BASE + '/api/attachment' + qs({ account: state.account, folder: effFolder, uid: uid, index: i });
         link.href = 'javascript:void(0)';
         link.style.cursor = 'pointer';
-        link.innerHTML = '<i class="fa-solid fa-file"></i> ' + esc(a.filename) + '（' + fmtSize(a.size) + '）';
+        link.innerHTML = '<i class="fa-solid fa-file"></i> ' + esc(displayName) + '（' + fmtSize(a.size) + '）';
+        link.dataset.displayName = displayName;
         link.onclick = function (ev) {
           ev.preventDefault();
           var progressId = 'dlProgress_' + i;
@@ -2922,7 +3001,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           var progressEl = document.createElement('div');
           progressEl.id = progressId;
           progressEl.style.cssText = 'margin:6px 0 2px;font-size:12px;color:#3b7bff;';
-          progressEl.textContent = '下载 ' + (a.filename || '附件') + '… 0%';
+          progressEl.textContent = '下载 ' + (displayName) + '… 0%';
           attach.appendChild(progressEl);
           var fmtMB = function (n) {
             return n < 1024 * 1024 ? (n / 1024).toFixed(0) + ' KB'
@@ -2930,7 +3009,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           };
           var updateProgress = function (loaded, total) {
             var pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
-            progressEl.textContent = '下载 ' + (a.filename || '附件') + '… ' + pct + '% (' + fmtMB(loaded) + ' / ' + fmtMB(total) + ')';
+            progressEl.textContent = '下载 ' + (displayName) + '… ' + pct + '% (' + fmtMB(loaded) + ' / ' + fmtMB(total) + ')';
           };
           fetch(href).then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2950,23 +3029,23 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
             }
             return read();
           }).then(function (data) {
-            progressEl.textContent = '下载 ' + (a.filename || '附件') + '… 已完成，准备保存';
+            progressEl.textContent = '下载 ' + (displayName) + '… 已完成，准备保存';
             if (window.showSaveFilePicker) {
-              return window.showSaveFilePicker({ suggestedName: a.filename || 'attachment' })
+              return window.showSaveFilePicker({ suggestedName: displayName })
                 .then(function (handle) { return handle.createWritable(); })
                 .then(function (writable) { return writable.write(data.blob).then(function () { return writable.close(); }); });
             }
             var url = URL.createObjectURL(data.blob);
             var tmp = document.createElement('a');
             tmp.href = url;
-            tmp.download = a.filename || '';
+            tmp.download = displayName;
             tmp.target = '_self';
             tmp.style.display = 'none';
             document.body.appendChild(tmp);
             tmp.click();
             setTimeout(function () { tmp.remove(); URL.revokeObjectURL(url); }, 1000);
           }).then(function () {
-            progressEl.textContent = '已保存 ' + (a.filename || '附件');
+            progressEl.textContent = '已保存 ' + (displayName);
             setTimeout(function () { if (progressEl.parentNode) progressEl.remove(); }, 3000);
           }).catch(function (err) {
             if (err && err.name === 'AbortError') { progressEl.remove(); return; }
@@ -3067,6 +3146,16 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   var searchInput = document.getElementById('searchInput');
   var searchTimer = null;
   if (searchInput) {
+    searchInput.oninput = function () {
+      if (this.value.trim() !== '') return;
+      if (state.view !== 'search') return;
+      state.view = 'folder';
+      state.searchQ = '';
+      state.offset = 0;
+      markActiveFolder();
+      markActiveLabel();
+      loadList();
+    };
     searchInput.onkeydown = function (e) {
       if (e.key !== 'Enter') return;
       var q = this.value.trim();
@@ -3587,7 +3676,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   });
   bindAc(document.getElementById('composeTo'));
   bindAc(document.getElementById('composeCc'));
-  document.getElementById('composeModal').addEventListener('close', acClose);
+  // acClose is called from input blur; no need for modal-close listener anymore
 
   function openPreview() {
     var to = getRecipients(document.getElementById('composeToContainer')).join(', ');
@@ -3733,7 +3822,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       });
     }).then(function (v) {
       btns.forEach(function (b) { b.disabled = false; b.innerHTML = '<i class="fa-solid fa-paper-plane"></i> 发送'; });
-      document.getElementById('composeModal').close();
+      document.getElementById('composeModal').setAttribute('hidden', '');
       showBanner('已发送至 ' + (v.accepted || []).join(', '));
       resetCompose();
     }).catch(function (err) {
@@ -3753,7 +3842,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   document.getElementById('composeBtn').onclick = function () {
     loadFromInfo();
     loadDraft();
-    document.getElementById('composeModal').showModal();
+    document.getElementById('composeModal').removeAttribute('hidden');
     document.getElementById('composeTo').focus();
   };
   function startReply(orig) { startQuoted(orig, 'reply'); }
@@ -3784,7 +3873,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     frame.style.display = 'block';
     frame.style.height = '';
     if (body) { body.style.overflow = 'visible'; body.style.flex = 'none'; }
-    document.getElementById('composeModal').showModal();
+    document.getElementById('composeModal').removeAttribute('hidden');
     setActiveEditor(note);
     note.focus();
     api('/api/message', { account: state.account, folder: orig.folder, uid: orig.uid }).then(function (v) {
@@ -3892,8 +3981,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     composeEditor.style.display = '';
     setActiveEditor(composeEditor);
   }
-  document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').close(); resetForwardView(); };
-  document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').close(); resetForwardView(); };
+  document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').setAttribute('hidden', ''); resetCompose(); };
+  document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').setAttribute('hidden', ''); resetCompose(); };
   document.getElementById('composeSend').onclick = doSend;
   document.getElementById('composeSend2').onclick = doSend;
   document.getElementById('composeForm').onsubmit = function (e) { e.preventDefault(); doSend(); };
