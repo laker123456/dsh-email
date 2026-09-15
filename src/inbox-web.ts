@@ -1878,7 +1878,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     });
   }
   function safeAttName(raw) {
-    var name = String(raw == null ? '' : raw).replace(/\\/g, '/').split('/').pop() || '';
+    var name = String(raw == null ? '' : raw).replace(/\\\\/g, '/').split('/').pop() || '';
     name = name.replace(/[ -]/g, '').replace(/[<>:"|?*]/g, '_').trim().replace(/[. ]+$/g, '');
     if (name === '' || name === '.' || name === '..' || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) name = 'attachment.bin';
     if (name.length > 120) {
