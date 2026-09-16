@@ -14,6 +14,8 @@ export interface ListedMessage {
    *  Use this for display in the inbox UI and for the LLM-facing tool output. */
   dateLocal?: string
   from: AddressEntry[]
+  /** To recipients from the envelope; allows the UI to render headers before the body loads. */
+  to?: AddressEntry[]
   /** CC recipients from the envelope; used to auto-fill CC on reply/forward. */
   cc?: AddressEntry[]
   subject: string

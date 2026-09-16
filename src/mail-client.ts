@@ -1,4 +1,4 @@
-import { ImapFlow } from 'imapflow'
+import { ImapFlow, type MessageStructureObject } from 'imapflow'
 import nodemailer, { type Transporter } from 'nodemailer'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
@@ -19,6 +19,7 @@ import type {
 } from './types.js'
 
 const LABEL_CACHE_TTL_MS = 5 * 60 * 1000
+const INLINE_IMAGE_MAX_BYTES = 64 * 1024 * 1024
 
 export class MailError extends Error {
   constructor(message: string) {
@@ -29,6 +30,13 @@ export class MailError extends Error {
 
 export function messageOf(error: unknown, fallback: string): string {
   return error instanceof Error && error.message !== '' ? error.message : fallback
+}
+
+/** Newest message date first, with UID as a deterministic tie-breaker. */
+export function compareListedNewest(a: ListedMessage, b: ListedMessage): number {
+  const timeA = Date.parse(a.date || '') || 0
+  const timeB = Date.parse(b.date || '') || 0
+  return timeB - timeA || b.uid - a.uid
 }
 
 /** True when any bodyStructure node declares an attachment disposition. */
@@ -44,6 +52,26 @@ interface AttachmentPart {
   filename: string
   contentType: string
   size: number
+}
+
+export interface HtmlBodyPartView {
+  html: string
+  text: string
+  inlineImages: { cid: string; part: string; contentType: string; size: number }[]
+}
+
+function collectBodyLeaves(node: MessageStructureObject | undefined, out: MessageStructureObject[] = []): MessageStructureObject[] {
+  if (node === undefined) return out
+  if (Array.isArray(node.childNodes) && node.childNodes.length > 0) {
+    for (const child of node.childNodes) collectBodyLeaves(child, out)
+  } else {
+    out.push(node)
+  }
+  return out
+}
+
+function normalizedContentId(value: string | undefined): string {
+  return typeof value === 'string' ? value.trim().replace(/^<|>$/g, '') : ''
 }
 
 /** Walk a bodyStructure tree collecting attachment parts (DFS, same order as mailparser). */
@@ -93,9 +121,9 @@ export function selectAttachmentPart(
   // 3) same-content-type match (size tolerance can be tight on misreported sizes)
   const byType = parts.find(part => part.contentType === meta.contentType)
   if (byType !== undefined) return byType
-  // 4) last resort: positional — assume body.attachments and parts[] are in
-  //    the same DFS order when the email has no filename metadata at all.
-  return parts[index]
+  // Never fall back to a different positional part: inline MIME resources can
+  // shift mailparser's order, and returning another file is worse than a 400.
+  return undefined
 }
 
 /** Case-insensitive match of a query against subject/from/body text. */
@@ -136,6 +164,7 @@ function listedFrom(envelope: any, size: number | undefined, hasAttachments: boo
     date: toIso(envelope.envelope?.date),
     dateLocal: toShanghaiLocal(envelope.envelope?.date),
     from: flattenAddresses(envelope.envelope?.from),
+    to: flattenAddresses(envelope.envelope?.to),
     cc: flattenAddresses(envelope.envelope?.cc),
     subject: envelope.envelope?.subject ?? '',
     seen: envelope.flags?.has('\\Seen') === true,
@@ -169,6 +198,7 @@ export class EmailPool {
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly labelCache = new Map<string, { value: EmailListResult; expireAt: number }>()
   private readonly sourceCache = new Map<string, { source: Buffer; expireAt: number }>()
+  private readonly sourceInflight = new Map<string, Promise<Buffer>>()
   private readonly folderCache = new Map<string, { value: EmailFoldersResult; expireAt: number }>()
   private idleTimer: NodeJS.Timeout | undefined
 
@@ -448,11 +478,7 @@ export class EmailPool {
         const msg = listedFrom(m, m.size, structureHasAttachment(m.bodyStructure))
         out.push({ ...msg, folder: folderName })
       }
-      out.sort((a, b) => {
-        const ta = Date.parse(a.date || '') || 0
-        const tb = Date.parse(b.date || '') || 0
-        return tb - ta
-      })
+      out.sort(compareListedNewest)
       return { account: name, count: uids.length, folder: folderName, messages: out }
     })
   }
@@ -491,11 +517,7 @@ export class EmailPool {
           all.push({ ...listedFrom(m, m.size, structureHasAttachment(m.bodyStructure)), folder: row.path })
         }
       }
-      all.sort((a, b) => {
-        const ta = Date.parse(a.date || '') || 0
-        const tb = Date.parse(b.date || '') || 0
-        return tb - ta
-      })
+      all.sort(compareListedNewest)
       return { account: name, count, folder: '', messages: all.slice(offset, offset + limit) }
     })
     // 我们切换过 mailbox，使池的 selected 记录失效，避免后续操作落在错误的文件夹
@@ -580,7 +602,7 @@ export class EmailPool {
     )
     return fetched
         .map(message => listedFrom(message, message.size, structureHasAttachment(message.bodyStructure)))
-        .sort((a, b) => b.uid - a.uid)
+        .sort(compareListedNewest)
   }
 
   private sourceCacheKey(name: string, uid: number, folder: string): string {
@@ -606,20 +628,35 @@ export class EmailPool {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
-    const key = this.sourceCacheKey(name, uid, folderName)
-    const cached = this.getSourceFromCache(key)
-    if (cached) {
-      const body = await parseRawMessage(cached, this.settings.maxBodyChars)
-      return { account: name, uid, folder: folderName, ...body }
-    }
+    const source = await this.readSource(name, uid, folderName)
+    const body = await parseRawMessage(source, this.settings.maxBodyChars)
+    return { account: name, uid, folder: folderName, ...body }
+  }
+
+  /** Cheap reader metadata for the web UI; never downloads body or inline-image bytes. */
+  async readWebMetadata(accountName: string | undefined, uid: number, folder: string): Promise<EmailReadResult> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
     return this.withImap(name, folderName, async (client) => {
-      const message = await client.fetchOne(uid, { uid: true, source: true }, { uid: true })
-      if (message === false || message.source === undefined) {
-        throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
+      const message = await client.fetchOne(uid, { uid: true, envelope: true, bodyStructure: true }, { uid: true })
+      if (message === false) throw new MailError('找不到 uid=' + uid + ' 的邮件')
+      const parts = collectAttachmentParts(message.bodyStructure)
+      return {
+        account: name,
+        uid,
+        folder: folderName,
+        date: toIso(message.envelope?.date),
+        dateLocal: toShanghaiLocal(message.envelope?.date),
+        from: flattenAddresses(message.envelope?.from),
+        to: flattenAddresses(message.envelope?.to),
+        cc: flattenAddresses(message.envelope?.cc),
+        subject: message.envelope?.subject ?? '',
+        text: '',
+        html: '',
+        attachments: parts.map(item => ({ filename: item.filename, contentType: item.contentType, size: item.size, part: item.part })),
+        truncated: false,
       }
-      this.setSourceCache(key, message.source)
-      const body = await parseRawMessage(message.source, this.settings.maxBodyChars)
-      return { account: name, uid, folder: folderName, ...body }
     })
   }
 
@@ -631,13 +668,82 @@ export class EmailPool {
     const key = this.sourceCacheKey(name, uid, folderName)
     const cached = this.getSourceFromCache(key)
     if (cached) return cached
-    return this.withImap(name, folderName, async (client) => {
+    const inflight = this.sourceInflight.get(key)
+    if (inflight) return inflight
+    const pending = this.withImap(name, folderName, async (client) => {
       const message = await client.fetchOne(uid, { uid: true, source: true }, { uid: true })
       if (message === false || message.source === undefined) {
         throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
       }
       this.setSourceCache(key, message.source)
       return message.source
+    })
+    this.sourceInflight.set(key, pending)
+    try {
+      return await pending
+    } finally {
+      if (this.sourceInflight.get(key) === pending) this.sourceInflight.delete(key)
+    }
+  }
+
+  /** Fetch only the textual MIME part. Inline images stay on IMAP until the browser requests them. */
+  async readHtmlBody(accountName: string | undefined, uid: number, folder: string): Promise<HtmlBodyPartView> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    return this.withImap(name, folderName, async (client) => {
+      const message = await client.fetchOne(uid, { uid: true, bodyStructure: true }, { uid: true })
+      if (message === false || message.bodyStructure === undefined) {
+        throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"）')
+      }
+      const leaves = collectBodyLeaves(message.bodyStructure)
+      const readable = leaves.filter(node => node.disposition?.toLowerCase() !== 'attachment')
+      const body = readable.find(node => node.type.toLowerCase() === 'text/html')
+        ?? readable.find(node => node.type.toLowerCase() === 'text/plain')
+      let html = ''
+      let text = ''
+      if (body !== undefined) {
+        const dl = await client.download(uid, body.part ?? '1', { uid: true, maxBytes: 20 * 1024 * 1024 })
+        const content = await collectStream(dl.content, 20 * 1024 * 1024)
+        if (body.type.toLowerCase() === 'text/html') html = content.toString('utf8')
+        else text = content.toString('utf8')
+      }
+      return {
+        html,
+        text,
+        inlineImages: readable
+          .filter(node => node.type.toLowerCase().startsWith('image/') && normalizedContentId(node.id) !== '' && node.part !== undefined)
+          .map(node => ({
+            cid: normalizedContentId(node.id),
+            part: String(node.part),
+            contentType: node.type,
+            size: typeof node.size === 'number' ? node.size : 0,
+          })),
+      }
+    })
+  }
+
+  /** Stream one inline image MIME part after the HTML is already visible. */
+  async streamInlineImage(
+    accountName: string | undefined,
+    uid: number,
+    folder: string,
+    part: string,
+    consume: (contentType: string, content: Readable) => Promise<void>,
+  ): Promise<void> {
+    if (!/^\d+(?:\.\d+)*$/.test(part)) throw new MailError('图片 part 无效')
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    return this.withImap(name, folderName, async (client) => {
+      const message = await client.fetchOne(uid, { uid: true, bodyStructure: true }, { uid: true })
+      if (message === false || message.bodyStructure === undefined) throw new MailError('找不到邮件')
+      const node = collectBodyLeaves(message.bodyStructure).find(item => String(item.part) === part)
+      if (node === undefined || !node.type.toLowerCase().startsWith('image/')) throw new MailError('找不到内嵌图片')
+      const maxBytes = Math.min(this.settings.maxAttachmentBytes, INLINE_IMAGE_MAX_BYTES)
+      if ((node.size ?? 0) > maxBytes) throw new MailError('内嵌图片超过大小上限')
+      const dl = await client.download(uid, part, { uid: true, maxBytes })
+      await consume(node.type, dl.content)
     })
   }
 
@@ -666,7 +772,12 @@ export class EmailPool {
   /** Mark multiple messages as seen (\\Seen) in a single IMAP session.
    *  Loop `messageFlagsAdd` per uid; one connect/mailboxOpen amortizes the
    *  handshake cost vs. calling `markSeen` N times. Empty `uids` is a noop. */
-  async markSeenBatch(accountName: string | undefined, folder: string, uids: number[]): Promise<void> {
+  async markSeenBatch(
+    accountName: string | undefined,
+    folder: string,
+    uids: number[],
+    onProgress?: (completed: number, total: number, uid: number) => void,
+  ): Promise<void> {
     if (!Array.isArray(uids) || uids.length === 0) return
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
@@ -675,9 +786,12 @@ export class EmailPool {
     try {
       await client.connect()
       await client.mailboxOpen(folderName, { readOnly: false })
+      let completed = 0
       for (const uid of uids) {
         if (!Number.isInteger(uid) || uid <= 0) continue
         await client.messageFlagsAdd(uid, ['\\Seen'], { uid: true })
+        completed += 1
+        onProgress?.(completed, uids.length, uid)
       }
     } catch (error) {
       throw this.normalizeImapError(error, folderName)

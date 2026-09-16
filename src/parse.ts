@@ -68,9 +68,21 @@ export function sanitizeFilename(raw: unknown, fallback = 'attachment.bin'): str
   return name
 }
 
+/** Exclude MIME resources rendered as part of the message body from downloads. */
+function downloadableAttachments(attachments: any[]): any[] {
+  return attachments.filter(att => {
+    const disposition = typeof att?.contentDisposition === 'string' ? att.contentDisposition.toLowerCase() : ''
+    if (disposition === 'attachment') return true
+    if (disposition === 'inline') return false
+    const cid = typeof att?.contentId === 'string' ? att.contentId.replace(/^<|>$/g, '').trim() : ''
+    if (cid !== '') return false
+    return typeof att?.filename === 'string' && att.filename.trim() !== ''
+  })
+}
+
 /** Parse a raw RFC822 message source into the read-result body. */
 export async function parseRawMessage(source: Buffer, maxBodyChars: number): Promise<ReadMessageBody> {
-  const parsed = await simpleParser(source)
+  const parsed = await simpleParser(source, { skipImageLinks: true })
   let text = parsed.text ?? ''
   if (text.trim() === '' && typeof parsed.html === 'string' && parsed.html.trim() !== '') {
     text = stripHtml(parsed.html)
@@ -80,7 +92,7 @@ export async function parseRawMessage(source: Buffer, maxBodyChars: number): Pro
   const htmlLimited = rawHtml.length > maxBodyChars
     ? { text: rawHtml.slice(0, maxBodyChars), truncated: true }
     : { text: rawHtml, truncated: false }
-  const attachments: EmailAttachmentMeta[] = (parsed.attachments ?? []).map((att, index) => ({
+  const attachments: EmailAttachmentMeta[] = downloadableAttachments(parsed.attachments ?? []).map((att, index) => ({
     filename: typeof att.filename === 'string' ? att.filename : '',
     contentType: att.contentType,
     size: att.size,
@@ -112,6 +124,8 @@ export interface HtmlMessageView {
   /** The html references at least one http(s) image (blocked by default). */
   hasRemoteImages: boolean
   attachments: EmailAttachmentMeta[]
+  /** Large CID images kept out of the HTML string for progressive delivery. */
+  inlineImages: { placeholder: string, contentType: string, content: Buffer }[]
 }
 
 const MAX_HTML_CHARS = 20 * 1024 * 1024
@@ -124,20 +138,26 @@ const REMOTE_IMG_RE = /<img[^>]*?\ssrc\s*=\s*(["'])https?:/i
  * network access all disabled), which is the actual security boundary.
  */
 export async function parseHtmlMessage(source: Buffer, maxInlineImageBytes: number): Promise<HtmlMessageView> {
-  const parsed = await simpleParser(source)
+  const parsed = await simpleParser(source, { skipImageLinks: true })
   let html = typeof parsed.html === 'string' ? parsed.html : ''
   if (html.length > MAX_HTML_CHARS) html = ''
   const inlineByCid = new Map<string, { contentType: string; content: Buffer }>()
   for (const att of parsed.attachments ?? []) {
     const cid = typeof att.contentId === 'string' ? att.contentId.replace(/^<|>$/g, '') : ''
-    if (cid !== '' && att.content.length <= maxInlineImageBytes) {
+    if (cid !== '') {
       inlineByCid.set(cid, { contentType: att.contentType, content: att.content })
     }
   }
+  const inlineImages: { placeholder: string, contentType: string, content: Buffer }[] = []
   if (html !== '' && inlineByCid.size > 0) {
     html = html.replace(CID_SRC_RE, (full: string, quote: string, cid: string) => {
       const att = inlineByCid.get(cid)
       if (att === undefined) return full
+      if (att.content.length > maxInlineImageBytes) {
+        const placeholder = 'dsh-inline-image:' + inlineImages.length
+        inlineImages.push({ placeholder, contentType: att.contentType, content: att.content })
+        return ' src=' + quote + placeholder + quote
+      }
       return ' src=' + quote + 'data:' + att.contentType + ';base64,' + att.content.toString('base64') + quote
     })
   }
@@ -148,11 +168,12 @@ export async function parseHtmlMessage(source: Buffer, maxInlineImageBytes: numb
     html,
     text: parsed.text ?? '',
     hasRemoteImages: html !== '' && REMOTE_IMG_RE.test(html),
-    attachments: (parsed.attachments ?? []).map((att, index) => ({
+    attachments: downloadableAttachments(parsed.attachments ?? []).map((att, index) => ({
       filename: typeof att.filename === 'string' ? att.filename : '',
       contentType: att.contentType,
       size: att.size,
       part: 'attachment-' + index,
     })),
+    inlineImages,
   }
 }

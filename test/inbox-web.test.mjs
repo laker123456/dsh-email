@@ -93,10 +93,43 @@ test('inbox page is served as no-store HTML', async () => {
   assert.equal(res.headers['cache-control'], 'no-store')
   assert.equal(res.headers['x-content-type-options'], 'nosniff')
   assert.ok(res.body().includes('收件箱'))
+  assert.ok(res.body().includes('id="markSeenProgress"'))
+  assert.ok(res.body().includes("'Accept': 'application/x-ndjson'"))
+  assert.ok(res.body().includes('function clearMessageDetail()'))
+  assert.ok(res.body().includes('renderMessageHeader(preview, uid, effFolder)'))
+  assert.ok(res.body().includes('id="bodyLoading"'))
+  assert.ok(res.body().includes("state.view !== 'folder' && state.view !== 'unread'"))
+  assert.ok(res.body().includes('if (!ok) state.offset = previousOffset'))
   assert.ok(res.body().includes(INBOX_ROUTE))
   const inlineScript = res.body().match(/<script>([\s\S]*?)<\/script>/)
   assert.ok(inlineScript)
   assert.doesNotThrow(() => new Function(inlineScript[1]))
+})
+
+test('POST /api/mark-seen-batch streams per-message progress when requested', async () => {
+  const holder = installRoute(() => ({
+    markSeenBatch: async (_account, _folder, uids, onProgress) => {
+      uids.forEach((uid, index) => onProgress(index + 1, uids.length, uid))
+    },
+  }))
+  const req = {
+    method: 'POST',
+    url: INBOX_ROUTE + '/api/mark-seen-batch',
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
+    async *[Symbol.asyncIterator]() {
+      yield Buffer.from(JSON.stringify({ folder: 'INBOX', uids: [11, 12] }), 'utf8')
+    },
+  }
+  const res = await call(holder.routes[0], req)
+  assert.equal(res.statusCode, 200)
+  assert.match(res.headers['content-type'], /application\/x-ndjson/)
+  const events = res.body().trim().split('\n').map(line => JSON.parse(line))
+  assert.deepEqual(events, [
+    { type: 'progress', completed: 1, total: 2, uid: 11 },
+    { type: 'progress', completed: 2, total: 2, uid: 12 },
+    { type: 'done', count: 2 },
+  ])
 })
 
 test('inbox rejects non-GET methods with 405', async () => {
@@ -140,14 +173,15 @@ test('message.html serves CSP-sandboxed HTML with cid images inlined', async () 
   assert.match(blocked.headers['content-type'], /text\/html/)
   const csp = blocked.headers['content-security-policy']
   assert.match(csp, /^default-src 'none'/)
-  assert.match(csp, /img-src data:;/)
+  assert.match(csp, /img-src 'self' data:;/)
   assert.match(csp, /frame-ancestors 'self'/)
   assert.ok(blocked.body().includes('data:image/png;base64,'))
   assert.ok(!blocked.body().includes('cid:img1'))
   assert.ok(blocked.body().includes('你好'))
+  assert.match(blocked.body(), /<img decoding="async" loading="lazy"/)
 
   const allowed = await call(route, fakeReq(INBOX_ROUTE + '/api/message.html?uid=5&images=1'))
-  assert.match(allowed.headers['content-security-policy'], /img-src data: http: https:/)
+  assert.match(allowed.headers['content-security-policy'], /img-src 'self' data: http: https:/)
 })
 
 test('message.html falls back to an escaped plain-text document', async () => {
@@ -156,6 +190,31 @@ test('message.html falls back to an escaped plain-text document', async () => {
   assert.equal(res.statusCode, 200)
   assert.ok(res.body().includes('<pre'))
   assert.ok(res.body().includes('纯文本内容'))
+})
+
+test('message.html externalizes a large data image for progressive rendering', async () => {
+  const image = Buffer.alloc(220 * 1024, 7)
+  const source = Buffer.from([
+    'From: a@b.c',
+    'Subject: large image',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    '<p>先显示正文</p><img src="data:image/png;base64,' + image.toString('base64') + '">',
+  ].join('\r\n'))
+  const holder = installRoute(() => ({ readSource: async () => source }))
+  const route = holder.routes[0]
+  const page = await call(route, fakeReq(INBOX_ROUTE + '/api/message.html?uid=9&images=1'))
+  assert.equal(page.statusCode, 200)
+  assert.ok(page.body().includes('先显示正文'))
+  assert.ok(!page.body().includes(image.toString('base64').slice(0, 100)))
+  const match = page.body().match(/src="([^\"]*\/api\/inline-image\?id=[^"]+)"/)
+  assert.ok(match)
+  assert.match(page.headers['content-security-policy'], /img-src 'self' data:/)
+
+  const imageRes = await call(route, fakeReq(match[1]))
+  assert.equal(imageRes.statusCode, 200)
+  assert.equal(imageRes.headers['content-type'], 'image/png')
+  assert.equal(Buffer.concat(imageRes.chunks).length, image.length)
 })
 
 test('messages-unread aggregates cross-folder unread with folder passthrough', async () => {

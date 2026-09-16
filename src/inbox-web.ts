@@ -2,6 +2,7 @@ import { mkdir, writeFile, readFile, lstat } from 'node:fs/promises'
 import { dirname, join, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir, homedir } from 'node:os'
+import { randomUUID } from 'node:crypto'
 import { clampInt, PROVIDER_NAMES, PROVIDER_PRESETS } from './config.js'
 import { EmailPool, MailError, messageOf } from './mail-client.js'
 import { parseHtmlMessage, truncateText } from './parse.js'
@@ -24,6 +25,18 @@ const ASSET_DIR = join(MODULE_DIR, '..', 'assets')
 
 const MAX_INLINE_IMAGE_BYTES = 512 * 1024
 const TEXT_FALLBACK_CHARS = 200000
+const DATA_IMAGE_EXTERNALIZE_CHARS = 256 * 1024
+const INLINE_IMAGE_CACHE_BYTES = 64 * 1024 * 1024
+const INLINE_IMAGE_CACHE_TTL_MS = 2 * 60 * 1000
+
+interface CachedInlineImage {
+  contentType: string
+  data: Buffer
+  expireAt: number
+}
+
+const inlineImageCache = new Map<string, CachedInlineImage>()
+let inlineImageCacheBytes = 0
 
 class InboxUsageError extends Error {}
 
@@ -67,13 +80,93 @@ function contentDisposition(filename: string): string {
 
 /** Message body document served straight into the sandboxed reader iframe. */
 function messageHtmlDocument(html: string, text: string): string {
-  const docStart = '<!DOCTYPE html><html><head><meta charset="utf-8"><base target="_blank"><style>html,body{margin:0;padding:0;}body{padding:12px;font:14px/1.7 -apple-system,\'Segoe UI\',\'PingFang SC\',\'Microsoft YaHei\',sans-serif;color:#333;}img{max-width:100%;height:auto;}table{max-width:100%;}</style></head><body>'
-  if (html !== '') return docStart + html + '</body></html>'
+  const docStart = '<!DOCTYPE html><html><head><meta charset="utf-8"><base target="_blank"><style>html,body{margin:0;padding:0;}body{padding:12px;font:14px/1.7 -apple-system,\'Segoe UI\',\'PingFang SC\',\'Microsoft YaHei\',sans-serif;color:#333;}img{max-width:100%;height:auto;content-visibility:auto;}table{max-width:100%;}</style></head><body>'
+  if (html !== '') return docStart + optimizeMessageImages(html) + '</body></html>'
   const limited = truncateText(text, TEXT_FALLBACK_CHARS).text
   return docStart
     + '<pre style="white-space:pre-wrap;word-wrap:break-word;margin:0;">'
     + escapeHtmlText(limited)
     + '</pre></body></html>'
+}
+
+/** Keep large inline/remote images from blocking the readable email body. */
+function optimizeMessageImages(html: string): string {
+  return html.replace(/<img\b[^>]*>/gi, tag => {
+    let optimized = tag
+    if (!/\sloading\s*=/i.test(optimized)) optimized = optimized.replace(/^<img\b/i, '<img loading="lazy"')
+    if (!/\sdecoding\s*=/i.test(optimized)) optimized = optimized.replace(/^<img\b/i, '<img decoding="async"')
+    return optimized
+  })
+}
+
+function cacheInlineImage(contentType: string, data: Buffer): string {
+  const now = Date.now()
+  for (const [id, entry] of inlineImageCache) {
+    if (entry.expireAt <= now) {
+      inlineImageCache.delete(id)
+      inlineImageCacheBytes -= entry.data.length
+    }
+  }
+  while (inlineImageCache.size > 0 && inlineImageCacheBytes + data.length > INLINE_IMAGE_CACHE_BYTES) {
+    const oldestId = inlineImageCache.keys().next().value as string | undefined
+    if (oldestId === undefined) break
+    const oldest = inlineImageCache.get(oldestId)
+    inlineImageCache.delete(oldestId)
+    if (oldest) inlineImageCacheBytes -= oldest.data.length
+  }
+  const id = randomUUID()
+  inlineImageCache.set(id, { contentType, data, expireAt: now + INLINE_IMAGE_CACHE_TTL_MS })
+  inlineImageCacheBytes += data.length
+  return id
+}
+
+/** Move huge data: images out of the HTML response so text can render first. */
+function externalizeLargeDataImages(html: string): string {
+  return html.replace(/(\ssrc\s*=\s*)(["'])(data:[^"']+)\2/gi, (full, prefix: string, quote: string, uri: string) => {
+    if (uri.length < DATA_IMAGE_EXTERNALIZE_CHARS) return full
+    const matched = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/i.exec(uri)
+    if (!matched || !/^image\//i.test(matched[1] ?? '')) return full
+    try {
+      const data = matched[2] ? Buffer.from(matched[3], 'base64') : Buffer.from(decodeURIComponent(matched[3]))
+      if (data.length === 0 || data.length > INLINE_IMAGE_CACHE_BYTES) return full
+      const id = cacheInlineImage(matched[1], data)
+      return prefix + quote + INBOX_ROUTE + '/api/inline-image?id=' + encodeURIComponent(id) + quote
+    } catch {
+      return full
+    }
+  })
+}
+
+function materializeInlineImages(
+  html: string,
+  images: { placeholder: string, contentType: string, content: Buffer }[],
+): string {
+  let rendered = html
+  for (const image of images) {
+    if (image.content.length === 0 || image.content.length > INLINE_IMAGE_CACHE_BYTES) continue
+    const id = cacheInlineImage(image.contentType, image.content)
+    const src = INBOX_ROUTE + '/api/inline-image?id=' + encodeURIComponent(id)
+    rendered = rendered.split(image.placeholder).join(src)
+  }
+  return rendered
+}
+
+/** Point cid: references at an IMAP MIME-part endpoint so HTML never waits for image bytes. */
+function materializeDeferredInlineImages(
+  html: string,
+  images: { cid: string; part: string }[],
+  account: string | undefined,
+  folder: string,
+  uid: number,
+): string {
+  const byCid = new Map(images.map(image => [image.cid, image.part]))
+  return html.replace(/(\ssrc\s*=\s*)(["'])cid:([^"'>]+)\2/gi, (full, prefix: string, quote: string, cid: string) => {
+    const part = byCid.get(cid)
+    if (part === undefined) return full
+    const params = new URLSearchParams({ uid: String(uid), folder, part })
+    if (account) params.set('account', account)
+    return prefix + quote + INBOX_ROUTE + '/api/inline-image?' + params.toString() + quote
+  })
 }
 
 async function readJsonBody(req: any, maxBytes = 64 * 1024): Promise<any> {
@@ -142,6 +235,22 @@ async function handleMarkSeenBatch(getPool: () => EmailPool, req: any, res: any)
   }
   if (uids.length === 0) {
     responseJson(res, 200, { ok: true, value: { count: 0 } })
+    return
+  }
+  const wantsProgress = String(req.headers?.accept ?? '').includes('application/x-ndjson')
+  if (wantsProgress) {
+    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-store')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.writeHead(200)
+    try {
+      await getPool().markSeenBatch(account, folder, uids, (completed, total, uid) => {
+        res.write(JSON.stringify({ type: 'progress', completed, total, uid }) + '\n')
+      })
+      res.end(JSON.stringify({ type: 'done', count: uids.length }) + '\n')
+    } catch (error) {
+      res.end(JSON.stringify({ type: 'error', message: messageOf(error, '批量标记已读失败') }) + '\n')
+    }
     return
   }
   try {
@@ -1000,22 +1109,71 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
     }
     if (sub === '/api/message') {
       const uid = requireUid(url)
-      const value = await getPool().read(account, uid, folder)
+      const value = await getPool().readWebMetadata(account, uid, folder)
       responseJson(res, 200, { ok: true, value })
       return
     }
     if (sub === '/api/message.html') {
       const uid = requireUid(url)
-      const source = await getPool().readSource(account, uid, folder)
-      const view = await parseHtmlMessage(source, MAX_INLINE_IMAGE_BYTES)
+      const pool = getPool()
+      let html: string
+      let text: string
+      if (typeof (pool as any).readHtmlBody === 'function') {
+        const segmented = await pool.readHtmlBody(account, uid, folder)
+        html = materializeDeferredInlineImages(segmented.html, segmented.inlineImages, account, folder, uid)
+        text = segmented.text
+      } else {
+        // Compatibility path for older embedders and lightweight test doubles.
+        const source = await pool.readSource(account, uid, folder)
+        const parsed = await parseHtmlMessage(source, MAX_INLINE_IMAGE_BYTES)
+        html = materializeInlineImages(parsed.html, parsed.inlineImages)
+        text = parsed.text
+      }
       // CSP is the real security boundary: script-src 'none' blocks all inline
       // scripts; img-src data: blocks tracking pixels until the user explicitly
       // opts in with images=1. No sandbox directive so the iframe stays
       // same-origin and the parent can measure its content height.
-      const csp = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data:"
+      const csp = "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:"
         + (url.searchParams.get('images') === '1' ? ' http: https:' : '')
         + "; frame-ancestors 'self'"
-      responseHtml(res, 200, messageHtmlDocument(view.html, view.text), { 'Content-Security-Policy': csp })
+      responseHtml(res, 200, messageHtmlDocument(externalizeLargeDataImages(html), text), { 'Content-Security-Policy': csp })
+      return
+    }
+    if (sub === '/api/inline-image') {
+      const id = url.searchParams.get('id') ?? ''
+      let contentType: string
+      let data: Buffer
+      if (id !== '') {
+        const image = inlineImageCache.get(id)
+        if (!image || image.expireAt <= Date.now()) {
+          if (image) {
+            inlineImageCache.delete(id)
+            inlineImageCacheBytes -= image.data.length
+          }
+          responseJson(res, 404, { ok: false, error: { code: 'not-found', message: '内嵌图片已过期，请重新打开邮件' } })
+          return
+        }
+        contentType = image.contentType
+        data = image.data
+      } else {
+        const uid = requireUid(url)
+        const part = url.searchParams.get('part') ?? ''
+        await getPool().streamInlineImage(account, uid, folder, part, async (streamContentType, stream) => {
+          res.setHeader('Content-Type', streamContentType)
+          res.setHeader('Cache-Control', 'private, max-age=120')
+          res.setHeader('X-Content-Type-Options', 'nosniff')
+          res.writeHead(200)
+          for await (const chunk of stream) res.write(chunk)
+          res.end()
+        })
+        return
+      }
+      res.setHeader('Content-Type', contentType)
+      res.setHeader('Content-Length', String(data.length))
+      res.setHeader('Cache-Control', 'private, max-age=120')
+      res.setHeader('X-Content-Type-Options', 'nosniff')
+      res.writeHead(200)
+      res.end(data)
       return
     }
     if (sub === '/api/attachment') {
@@ -1172,6 +1330,28 @@ button, select, input { font: inherit; }
   color: #333; cursor: pointer; display: flex; align-items: center; gap: 4px;
 }
 .list-toolbar button:hover { background: #e6e9f0; }
+.list-toolbar button:disabled { cursor: default; opacity: .65; }
+#markSeenProgress {
+  position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+  background: rgba(20, 28, 40, .18); backdrop-filter: blur(1px); z-index: 200;
+}
+#markSeenProgress .progress-card {
+  width: 180px; padding: 24px 20px 20px; border: 1px solid #e1e6ed; border-radius: 14px;
+  background: #fff; box-shadow: 0 12px 36px rgba(20, 28, 40, .2); text-align: center;
+}
+#markSeenProgress .progress-ring { position: relative; width: 96px; height: 96px; margin: 0 auto 14px; }
+#markSeenProgress svg { width: 96px; height: 96px; transform: rotate(-90deg); }
+#markSeenProgress circle { fill: none; stroke-width: 8; }
+#markSeenProgress .progress-track { stroke: #edf0f5; }
+#markSeenProgress .progress-value {
+  stroke: #3b7bff; stroke-linecap: round; stroke-dasharray: 251.33; stroke-dashoffset: 251.33;
+  transition: stroke-dashoffset .2s ease;
+}
+#markSeenProgress .progress-count {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: #27364a; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+#markSeenProgress .progress-label { color: #4a5566; font-size: 13px; }
 #messages { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
 #messages li { padding: 10px 14px; border-bottom: 1px solid #dec89f; cursor: pointer; }
 #messages li:hover { background: #f3e3cd; }
@@ -1216,6 +1396,8 @@ button, select, input { font: inherit; }
 #readerHead .sender-email { color: #888; font-weight: normal; }
 #readerHead .recipient-line { color: #888; }
 #readerHead .kv { color: #888; }
+#readerBody { position: relative; flex: 1; min-height: 200px; flex-shrink: 0; }
+#bodyLoading { position: absolute; inset: 0; z-index: 2; align-items: center; justify-content: center; gap: 7px; color: #6b7280; font-size: 12px; background: #fff; }
 #placeholder { color: #8a97a8; padding: 40px; text-align: center; }
 #frame { border: none; width: 100%; background: #fff; min-height: 200px; flex-shrink: 0; }
 #attach { padding: 10px 24px; background: #fff; border-bottom: 1px solid #f0f0f0; font-size: 12px; flex-shrink: 0; }
@@ -1617,6 +1799,18 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         <i class="fa-solid fa-envelope-open"></i> 当前页标为已读
       </button>
     </div>
+    <div id="markSeenProgress" role="status" aria-live="polite">
+      <div class="progress-card">
+        <div class="progress-ring">
+          <svg viewBox="0 0 96 96" aria-hidden="true">
+            <circle class="progress-track" cx="48" cy="48" r="40"></circle>
+            <circle id="markSeenProgressCircle" class="progress-value" cx="48" cy="48" r="40"></circle>
+          </svg>
+          <span id="markSeenProgressCount" class="progress-count">0/0</span>
+        </div>
+        <div class="progress-label"><i class="fa-solid fa-envelope-open"></i> 正在标记已读</div>
+      </div>
+    </div>
     <ul id="messages"></ul>
   </div>
 
@@ -1639,7 +1833,12 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       </div>
       <div id="readerHead"><div id="placeholder"><i class="fa-regular fa-envelope-open" style="font-size:32px; color:#d0d7de"></i><div style="margin-top:8px">在左侧选择一封邮件阅读</div></div></div>
       <div id="attach" style="display:none"></div>
-      <iframe id="frame" referrerpolicy="no-referrer" title="邮件正文"></iframe>
+      <div id="readerBody">
+        <div id="bodyLoading" style="display:none">
+          <i class="fa-solid fa-circle-notch fa-spin" style="color:#3b7bff"></i><span>正文加载中…</span>
+        </div>
+        <iframe id="frame" referrerpolicy="no-referrer" title="邮件正文"></iframe>
+      </div>
     </div>
   </div>
 
@@ -1868,7 +2067,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [], zoom: 1 };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [], zoom: 1, markSeenBusy: false, listVersion: 0, loadingMore: false };
   var currentMsg = null;
   var LABEL_COLORS = ['#e0a37a', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
@@ -2097,7 +2296,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       unreadBtn.onclick = function () {
         if (state.view === 'unread') return;
         state.view = 'unread';
-        state.uid = null;
         state.offset = 0;
         markActiveFolder();
         markActiveLabel();
@@ -2133,8 +2331,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           if (state.view === 'folder' && state.folder === f.path) return;
           state.view = 'folder';
           state.folder = f.path;
-          state.uid = null;
           state.offset = 0;
+          clearMessageDetail();
           markActiveFolder();
           markActiveLabel();
           loadList();
@@ -2172,7 +2370,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       todoBtn.onclick = function () {
         if (state.view === 'todo') return;
         state.view = 'todo';
-        state.uid = null;
         markActiveFolder();
         markActiveLabel();
         openTodoView();
@@ -2225,6 +2422,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   function openTodoView() {
     state.labelId = '';
     state.offset = 0;
+    clearMessageDetail();
     var listEl = document.getElementById('messages');
     listEl.innerHTML = '';
     var loading = document.createElement('li');
@@ -2369,13 +2567,15 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var listViews = { folder: 1, label: 1, unread: 1, todo: 1 };
     btn.style.display = listViews[state.view] ? '' : 'none';
     var count = document.querySelectorAll('#messages li[data-uid][data-seen="0"]').length;
-    btn.disabled = count === 0;
+    btn.disabled = state.markSeenBusy || count === 0;
     btn.dataset.count = String(count);
     btn.title = count > 0 ? ('当前列表有 ' + count + ' 封未读邮件') : '';
+    if (!state.markSeenBusy) btn.innerHTML = '<i class="fa-solid fa-envelope-open"></i> 当前页标为已读';
   }
   function openUnreadView() {
     state.labelId = '';
     state.offset = 0;
+    clearMessageDetail();
     var listEl = document.getElementById('messages');
     listEl.innerHTML = '';
     var loading = document.createElement('li');
@@ -2388,11 +2588,14 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   }
   function loadUnreadList() {
     var listEl = document.getElementById('messages');
+    var requestVersion = state.listVersion;
     if (state.offset === 0) listEl.innerHTML = '';
     return api('/api/messages-unread', { account: state.account, limit: state.limit, offset: state.offset }).then(function (value) {
+      if (requestVersion !== state.listVersion || state.view !== 'unread') return false;
       var had = listEl.querySelectorAll('li[data-uid]').length;
       var msgs = value.messages || [];
       msgs.forEach(function (m) { listEl.appendChild(unreadRowEl(m)); });
+      sortMessageRowsByDate(listEl);
       if (typeof value.count === 'number' && value.count > 0) setUnreadBadge(value.count);
       var shown = listEl.querySelectorAll('li[data-uid]').length;
       state.hasMore = shown < value.count;
@@ -2408,7 +2611,11 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         listEl.appendChild(endHint);
       }
       updateMarkSeenBtn();
-    }).catch(function (err) { showBanner(err.message); });
+      return true;
+    }).catch(function (err) {
+      if (requestVersion === state.listVersion) showBanner(err.message);
+      return false;
+    });
   }
   function unreadRowEl(m) {
     var li = rowEl(m);
@@ -2501,8 +2708,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
                 if (state.view === 'label' && state.labelId === l.id) {
                   state.view = 'folder';
                   state.labelId = '';
-                  state.uid = null;
                   state.offset = 0;
+                  clearMessageDetail();
                   loadList();
                 }
                 loadLabels();
@@ -2514,8 +2721,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           if (state.view === 'label' && state.labelId === l.id) return;
           state.view = 'label';
           state.labelId = l.id;
-          state.uid = null;
           state.offset = 0;
+          clearMessageDetail();
           markActiveFolder();
           markActiveLabel();
           loadList();
@@ -2648,12 +2855,22 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     meta.appendChild(from);
     meta.appendChild(date);
     li.appendChild(meta);
-    li.onclick = function () { openMessage(m.uid, effFolder); };
+    li.onclick = function () { openMessage(m.uid, effFolder, m); };
     li.oncontextmenu = function (e) {
       e.preventDefault();
       openCtxMenu(e, li);
     };
     return li;
+  }
+
+  function sortMessageRowsByDate(listEl) {
+    var rows = Array.from(listEl.querySelectorAll('li[data-uid]'));
+    rows.sort(function (a, b) {
+      var timeA = Date.parse(a.dataset.date || '') || 0;
+      var timeB = Date.parse(b.dataset.date || '') || 0;
+      return timeB - timeA || (Number(b.dataset.uid) || 0) - (Number(a.dataset.uid) || 0);
+    });
+    rows.forEach(function (row) { listEl.appendChild(row); });
   }
 
   function openCtxMenu(e, li) {
@@ -2798,6 +3015,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 
   function loadList() {
     var listEl = document.getElementById('messages');
+    var requestVersion = state.listVersion;
+    var requestView = state.view;
     if (state.offset === 0) listEl.innerHTML = '';
     var params;
     if (state.view === 'label') {
@@ -2806,7 +3025,9 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       params = { account: state.account, folder: state.folder, limit: state.limit, offset: state.offset, unreadOnly: state.unreadOnly };
     }
     return api('/api/messages', params).then(function (value) {
+      if (requestVersion !== state.listVersion || requestView !== state.view) return false;
       (value.messages || []).forEach(function (m) { listEl.appendChild(rowEl(m)); });
+      sortMessageRowsByDate(listEl);
       var shown = listEl.children.length;
       state.hasMore = shown < value.count;
       if (shown === 0) {
@@ -2821,7 +3042,11 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         listEl.appendChild(endHint);
       }
       updateMarkSeenBtn();
-    }).catch(function (err) { showBanner(err.message); });
+      return true;
+    }).catch(function (err) {
+      if (requestVersion === state.listVersion) showBanner(err.message);
+      return false;
+    });
   }
   function silentRefresh() {
     if (state.offset !== 0) return Promise.resolve();
@@ -2861,6 +3086,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           listEl.insertBefore(prependBucket[j], listEl.firstChild);
         }
       }
+      sortMessageRowsByDate(listEl);
       var shown = listEl.children.length;
       var more = document.getElementById('more');
       if (more) more.style.display = (state.view === 'label' || shown >= value.count) ? 'none' : '';
@@ -2876,34 +3102,54 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   function loadFrame(folder, uid, token) {
     var frame = document.getElementById('frame');
     frame.style.height = '600px';
+    if (frame._messageResizeObserver) {
+      frame._messageResizeObserver.disconnect();
+      frame._messageResizeObserver = null;
+    }
     try {
       frame.contentWindow.document.open();
       frame.contentWindow.document.write('<div></div>');
       frame.contentWindow.document.close();
     } catch (e) { /* cross-origin or not ready */ }
     var pollTimer = null;
-    frame.onload = function () {
+    var attempts = 0;
+    var syncFrame = function () {
       if (token !== state.openToken) return;
-      var loading = document.getElementById('readerLoading');
-      if (loading) loading.style.display = 'none';
-      var attempts = 0;
-      var trySize = function () {
-        if (token !== state.openToken) return;
-        attempts++;
-        try {
-          var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
-          if (!doc || !doc.body) { if (attempts < 20) pollTimer = setTimeout(trySize, 150); return; }
-          var h = doc.body.scrollHeight;
-          if (h > 0) { frame.style.height = (h + 16) + 'px'; }
-          if (attempts < 20) pollTimer = setTimeout(trySize, 300);
-        } catch (e) { /* ignore */ }
-      };
-      trySize();
-      applyZoom();
+      attempts++;
+      try {
+        var doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+        var href = doc && doc.location ? String(doc.location.href) : '';
+        if (!doc || !doc.body || href.indexOf('/api/message.html') < 0) {
+          if (attempts < 120) pollTimer = setTimeout(syncFrame, 100);
+          return;
+        }
+        var loading = document.getElementById('readerLoading');
+        if (loading) loading.style.display = 'none';
+        var bodyLoading = document.getElementById('bodyLoading');
+        if (bodyLoading) bodyLoading.style.display = 'none';
+        var resize = function () {
+          if (token !== state.openToken || !doc.body) return;
+          var h = Math.max(doc.body.scrollHeight, doc.documentElement ? doc.documentElement.scrollHeight : 0);
+          if (h > 0) frame.style.height = (h + 16) + 'px';
+        };
+        resize();
+        applyZoom();
+        if (!frame._messageResizeObserver && typeof ResizeObserver !== 'undefined') {
+          var observer = new ResizeObserver(resize);
+          observer.observe(doc.body);
+          if (doc.documentElement) observer.observe(doc.documentElement);
+          frame._messageResizeObserver = observer;
+        }
+        if (attempts < 120 && doc.readyState !== 'complete') pollTimer = setTimeout(syncFrame, 100);
+      } catch (e) {
+        if (attempts < 120) pollTimer = setTimeout(syncFrame, 100);
+      }
     };
+    frame.onload = syncFrame;
     frame.src = BASE + '/api/message.html' + qs({
       account: state.account, folder: folder, uid: uid, images: state.imagesAllowed,
     });
+    pollTimer = setTimeout(syncFrame, 50);
   }
 
   function applyZoom() {
@@ -2947,6 +3193,40 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       if (el) el.disabled = !on;
     });
   }
+  function clearMessageDetail() {
+    state.uid = null;
+    currentMsg = null;
+    state.openToken++;
+    state.listVersion++;
+    state.loadingMore = false;
+    state.hasMore = undefined;
+    var messages = document.getElementById('messages');
+    if (messages) messages.scrollTop = 0;
+    var frame = document.getElementById('frame');
+    if (frame) {
+      frame.onload = null;
+      frame.removeAttribute('src');
+      frame.style.display = 'none';
+      frame.style.height = '0';
+      if (frame._messageResizeObserver) {
+        frame._messageResizeObserver.disconnect();
+        frame._messageResizeObserver = null;
+      }
+    }
+    var loading = document.getElementById('readerLoading');
+    if (loading) loading.style.display = 'none';
+    var bodyLoading = document.getElementById('bodyLoading');
+    if (bodyLoading) bodyLoading.style.display = 'none';
+    var head = document.getElementById('readerHead');
+    if (head) head.innerHTML = '<div id="placeholder"><i class="fa-regular fa-envelope-open" style="font-size:32px; color:#d0d7de"></i><div style="margin-top:8px">在左侧选择一封邮件阅读</div></div>';
+    var attach = document.getElementById('attach');
+    if (attach) { attach.innerHTML = ''; attach.style.display = 'none'; }
+    var meta = document.getElementById('readerMeta');
+    if (meta) meta.textContent = '';
+    var seenLabel = document.getElementById('detailSeenLabel');
+    if (seenLabel) seenLabel.textContent = '设为已读';
+    setDetailActionsEnabled(false);
+  }
   function updateDetailSeenLabel() {
     var label = document.getElementById('detailSeenLabel');
     if (!label || !currentMsg) return;
@@ -2982,12 +3262,49 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     });
   };
 
-  function openMessage(uid, folder) {
+  function renderMessageHeader(v, uid, folder) {
+    var head = document.getElementById('readerHead');
+    var fromParsed = parseAddr((v.from || [])[0]);
+    var fromName = fromParsed.name || fromParsed.address || '(未知)';
+    var to = (v.to || []).map(function (a) {
+      var p = parseAddr(a);
+      return p.name ? p.name + ' <' + p.address + '>' : p.address;
+    }).join(', ');
+    var cc = (v.cc || []).map(function (a) {
+      var p = parseAddr(a);
+      return p.name ? p.name + ' <' + p.address + '>' : p.address;
+    }).join(', ');
+    document.getElementById('readerMeta').textContent = fmtDate(v.date, v.dateLocal);
+    head.innerHTML =
+      '<h2>' + esc(v.subject || '(无主题)') + '</h2>' +
+      '<div class="meta-row">' +
+        '<div class="avatar-tag">' + esc(avatarLetter(fromName)) + '</div>' +
+        '<div class="meta-info">' +
+          '<div class="sender-line"><span class="sender-name">' + esc(fromName) + '</span> <span class="sender-email">&lt;' + esc(fromParsed.address) + '&gt;</span></div>' +
+          '<div class="recipient-line">收件人：' + esc(to) + (cc ? ' · 抄送：' + esc(cc) : '') + '</div>' +
+        '</div>' +
+      '</div>';
+    currentMsg = {
+      uid: uid,
+      folder: folder,
+      subject: v.subject || '',
+      from: fromName + (fromParsed.address ? ' <' + fromParsed.address + '>' : ''),
+      to: to,
+      cc: cc,
+      date: v.date || '',
+      seen: true,
+    };
+    setDetailActionsEnabled(true);
+    updateDetailSeenLabel();
+  }
+
+  function openMessage(uid, folder, preview) {
     var effFolder = folder || state.folder;
     state.uid = uid;
     state.imagesAllowed = true;
     var token = ++state.openToken;
     var frame = document.getElementById('frame');
+    frame.style.display = '';
     frame.removeAttribute('src');
     frame.onload = null;
     var items = document.getElementById('messages').children;
@@ -3013,42 +3330,19 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var head = document.getElementById('readerHead');
     head.innerHTML = '';
     var loading = document.getElementById('readerLoading');
-    loading.style.display = 'flex';
+    var bodyLoading = document.getElementById('bodyLoading');
+    if (preview) {
+      renderMessageHeader(preview, uid, effFolder);
+      loading.style.display = 'none';
+      bodyLoading.style.display = 'flex';
+    } else {
+      loading.style.display = 'flex';
+      bodyLoading.style.display = 'none';
+    }
     loadFrame(effFolder, uid, token);
     api('/api/message', { account: state.account, folder: effFolder, uid: uid }).then(function (v) {
       if (token !== state.openToken) return;
-      var fromParsed = parseAddr((v.from || [])[0]);
-      var fromName = fromParsed.name || fromParsed.address || '(未知)';
-      var to = (v.to || []).map(function (a) {
-        var p = parseAddr(a);
-        return p.name ? p.name + ' <' + p.address + '>' : p.address;
-      }).join(', ');
-      var cc = (v.cc || []).map(function (a) {
-        var p = parseAddr(a);
-        return p.name ? p.name + ' <' + p.address + '>' : p.address;
-      }).join(', ');
-      document.getElementById('readerMeta').textContent = fmtDate(v.date, v.dateLocal);
-      head.innerHTML =
-        '<h2>' + esc(v.subject || '(无主题)') + '</h2>' +
-        '<div class="meta-row">' +
-          '<div class="avatar-tag">' + esc(avatarLetter(fromName)) + '</div>' +
-          '<div class="meta-info">' +
-            '<div class="sender-line"><span class="sender-name">' + esc(fromName) + '</span> <span class="sender-email">&lt;' + esc(fromParsed.address) + '&gt;</span></div>' +
-            '<div class="recipient-line">收件人：' + esc(to) + (cc ? ' · 抄送：' + esc(cc) : '') + '</div>' +
-          '</div>' +
-        '</div>';
-      currentMsg = {
-        uid: uid,
-        folder: effFolder,
-        subject: v.subject || '',
-        from: fromName + (fromParsed.address ? ' <' + fromParsed.address + '>' : ''),
-        to: to,
-        cc: cc,
-        date: v.date || '',
-        seen: true,
-      };
-      setDetailActionsEnabled(true);
-      updateDetailSeenLabel();
+      renderMessageHeader(v, uid, effFolder);
       var attach = document.getElementById('attach');
       attach.innerHTML = '';
       (v.attachments || []).forEach(function (a, i) {
@@ -3127,7 +3421,8 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }).catch(function (err) {
       if (token !== state.openToken) return;
       loading.style.display = 'none';
-      head.innerHTML = '<div id="placeholder">' + esc(err.message) + '</div>';
+      if (!preview) head.innerHTML = '<div id="placeholder">' + esc(err.message) + '</div>';
+      else showBanner('邮件详情加载失败：' + err.message);
     });
   }
 
@@ -3135,6 +3430,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (state.view === 'label' || state.view === 'unread') { this.checked = false; return; }
     state.unreadOnly = this.checked;
     state.offset = 0;
+    clearMessageDetail();
     if (state.view === 'todo') {
       fetch(BASE + '/api/todos').then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
         loadTodoList((d && d.ok && Array.isArray(d.value)) ? d.value : [], state.unreadOnly);
@@ -3153,34 +3449,93 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       (byFolder[f] = byFolder[f] || []).push(Number(li.dataset.uid));
     });
     var total = targets.length;
+    var completedByFolder = {};
+    var completedKeys = {};
+    var progressWrap = document.getElementById('markSeenProgress');
+    var progressCircle = document.getElementById('markSeenProgressCircle');
+    var progressCount = document.getElementById('markSeenProgressCount');
+    var btn = this;
+    function updateProgress() {
+      var completed = Object.keys(completedByFolder).reduce(function (sum, folder) { return sum + completedByFolder[folder]; }, 0);
+      var circumference = 2 * Math.PI * 40;
+      var ratio = total > 0 ? Math.min(1, completed / total) : 0;
+      progressCircle.style.strokeDashoffset = String(circumference * (1 - ratio));
+      progressCount.textContent = completed + '/' + total;
+      btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> 标记中 ' + completed + '/' + total;
+    }
+    function applyProgress(folder, event) {
+      completedByFolder[folder] = Math.max(completedByFolder[folder] || 0, Number(event.completed) || 0);
+      var key = JSON.stringify([folder, event.uid]);
+      if (!completedKeys[key]) {
+        completedKeys[key] = true;
+        for (var i = 0; i < targets.length; i++) {
+          var li = targets[i];
+          if (String(li.dataset.uid) === String(event.uid) && (li.dataset.folder || state.folder) === folder) {
+            li.classList.remove('unread');
+            li.dataset.seen = '1';
+            bumpUnreadBadge(-1);
+            bumpFolderBadge(folder, -1);
+            if (state.unreadOnly && li.parentNode) li.parentNode.removeChild(li);
+            break;
+          }
+        }
+      }
+      updateProgress();
+    }
+    function readProgressResponse(response, folder) {
+      if (!response.ok) {
+        return response.json().catch(function () { return null; }).then(function (d) {
+          throw new Error((d && d.error && d.error.message) || ('HTTP ' + response.status));
+        });
+      }
+      if (!response.body || typeof response.body.getReader !== 'function') throw new Error('当前浏览器不支持实时进度');
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var pending = '';
+      function handleLine(line) {
+        if (!line.trim()) return;
+        var event = JSON.parse(line);
+        if (event.type === 'progress') applyProgress(folder, event);
+        if (event.type === 'error') throw new Error(event.message || '批量标记失败');
+      }
+      function pump() {
+        return reader.read().then(function (result) {
+          pending += decoder.decode(result.value || new Uint8Array(), { stream: !result.done });
+          var lines = pending.split('\\n');
+          pending = lines.pop() || '';
+          lines.forEach(handleLine);
+          if (!result.done) return pump();
+          if (pending) handleLine(pending);
+        });
+      }
+      return pump();
+    }
+    state.markSeenBusy = true;
+    progressWrap.style.display = 'flex';
+    this.disabled = true;
+    updateProgress();
     var promises = Object.keys(byFolder).map(function (folder) {
+      completedByFolder[folder] = 0;
       return fetch(BASE + '/api/mark-seen-batch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/x-ndjson' },
         body: JSON.stringify({ account: state.account, folder: folder, uids: byFolder[folder] }),
-      }).then(function (r) { return r.json().catch(function () { return null; }); });
+      }).then(function (r) { return readProgressResponse(r, folder); });
     });
-    this.disabled = true;
-    Promise.all(promises).then(function (results) {
-      var ok = Array.isArray(results) && results.length > 0 && results.every(function (r) { return r && r.ok; });
-      if (!ok) {
-        showBanner('部分邮件标记失败');
-        updateMarkSeenBtn();
+    Promise.allSettled(promises).then(function (results) {
+      var failed = results.find(function (result) { return result.status === 'rejected'; });
+      if (!failed) {
+        showBanner('已将 ' + total + ' 封邮件标为已读');
         return;
       }
-      targets.forEach(function (li) {
-        li.classList.remove('unread');
-        li.dataset.seen = '1';
-      });
-      bumpUnreadBadge(-total);
-      Object.keys(byFolder).forEach(function (f) { bumpFolderBadge(f, -byFolder[f].length); });
-      if (state.unreadOnly) {
-        targets.forEach(function (li) { if (li.parentNode) li.parentNode.removeChild(li); });
-      }
-      showBanner('已将 ' + total + ' 封邮件标为已读');
-      updateMarkSeenBtn();
-    }).catch(function (err) {
-      showBanner((err && err.message) || '批量标记失败');
+      var err = failed.reason;
+      var completed = Object.keys(completedKeys).length;
+      showBanner(completed > 0
+        ? ('已标记 ' + completed + '/' + total + ' 封，剩余失败：' + ((err && err.message) || '批量标记失败'))
+        : ((err && err.message) || '批量标记失败'));
+    }).then(function () {
+      state.markSeenBusy = false;
+      progressWrap.style.display = 'none';
       updateMarkSeenBtn();
     });
   };
@@ -3218,6 +3573,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       state.view = 'folder';
       state.searchQ = '';
       state.offset = 0;
+      clearMessageDetail();
       markActiveFolder();
       markActiveLabel();
       loadList();
@@ -3229,6 +3585,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         if (state.view === 'search') {
           state.view = 'folder';
           state.offset = 0;
+          clearMessageDetail();
           loadList();
         }
         return;
@@ -3237,6 +3594,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       state.view = 'search';
       state.searchQ = q;
       state.offset = 0;
+      clearMessageDetail();
       markActiveFolder();
       markActiveLabel();
       var listEl = document.getElementById('messages');
@@ -3268,6 +3626,10 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     btn.disabled = true;
     btn.innerHTML = '<i class="fa-solid fa-rotate fa-spin"></i> 收信';
     loading.style.display = 'flex';
+    state.offset = 0;
+    state.hasMore = undefined;
+    var messages = document.getElementById('messages');
+    if (messages) messages.scrollTop = 0;
     loadFolders().then(function () {
       if (state.view === 'unread') return loadUnreadList();
       return loadList().then(silentRefresh);
@@ -3290,21 +3652,25 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
   (function () {
     var messages = document.getElementById('messages');
     if (!messages) return;
-    var loadingMore = false;
     var onScroll = function () {
-      if (loadingMore) return;
-      if (state.view === 'label') return;
+      if (state.loadingMore) return;
+      if (state.view !== 'folder' && state.view !== 'unread') return;
       if (state.hasMore === false) return;
       var remaining = messages.scrollHeight - messages.scrollTop - messages.clientHeight;
       if (remaining > 200) return;
-      loadingMore = true;
+      state.loadingMore = true;
+      var requestVersion = state.listVersion;
+      var previousOffset = state.offset;
       state.offset += state.limit;
-      var done = function () { loadingMore = false; };
+      var done = function (ok) {
+        if (requestVersion !== state.listVersion) return;
+        if (!ok) state.offset = previousOffset;
+        state.loadingMore = false;
+      };
       if (state.view === 'unread') loadUnreadList().then(done, done);
       else loadList().then(done, done);
     };
     messages.addEventListener('scroll', onScroll, { passive: true });
-    onScroll();
   })();
   document.getElementById('addLabelBtn').onclick = function () {
     openLabelModal(null);

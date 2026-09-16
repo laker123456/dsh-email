@@ -113,7 +113,9 @@ test('parseHtmlMessage rewrites cid images to data URIs and flags remote images'
   assert.ok(view.html.includes('data:image/png;base64,'))
   assert.ok(!view.html.includes('cid:img1'))
   assert.equal(view.hasRemoteImages, true)
-  assert.equal(view.attachments.length, 1)
+  assert.equal(view.attachments.length, 0)
+  const body = await parseRawMessage(source, 20000)
+  assert.equal(body.attachments.length, 0)
 })
 
 test('parseHtmlMessage keeps inline images without a contentId untouched', async () => {
@@ -137,7 +139,7 @@ test('parseHtmlMessage returns empty html for plain-text mail', async () => {
 })
 
 test('parseHtmlMessage drops oversized html', async () => {
-  const html = '<p>' + 'x'.repeat(2 * 1024 * 1024 + 100) + '</p>'
+  const html = '<p>' + 'x'.repeat(21 * 1024 * 1024) + '</p>'
   const source = Buffer.from('From: a@b.c\r\nSubject: big\r\nContent-Type: text/html\r\n\r\n' + html)
   const view = await parseHtmlMessage(source, 1024)
   assert.equal(view.html, '')
@@ -161,4 +163,15 @@ test('selectAttachmentPart maps the mailparser list onto bodyStructure parts', a
   // type + tolerant size fallback when the name differs
   const renamed = [{ filename: 'renamed.bin', contentType: 'application/pdf', size: 95, part: 'attachment-0' }]
   assert.equal(selectAttachmentPart(renamed, parts, 0).part, '2')
+})
+
+test('compareListedNewest sorts by message date then UID descending', async () => {
+  const { compareListedNewest } = await import('../lib/index.js')
+  const rows = [
+    { uid: 30, date: '2026-01-01T08:00:00.000Z' },
+    { uid: 10, date: '2026-01-03T08:00:00.000Z' },
+    { uid: 20, date: '2026-01-03T08:00:00.000Z' },
+  ]
+  rows.sort(compareListedNewest)
+  assert.deepEqual(rows.map(row => row.uid), [20, 10, 30])
 })
