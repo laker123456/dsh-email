@@ -86,8 +86,14 @@ export interface EmailSendResult {
 export interface EmailFolderRow {
   name: string
   path: string
+  /** IMAP hierarchy delimiter, usually "." or "/". */
+  delimiter: string
+  /** Full path of the parent mailbox; empty for a root mailbox. */
+  parentPath: string
   specialUse: string
   subscribed: boolean
+  /** False for hierarchy-only mailboxes carrying the IMAP \\Noselect flag. */
+  selectable: boolean
   /** Total message count (from IMAP STATUS), -1 when not fetched. */
   total: number
   /** Unseen count (from IMAP STATUS), -1 when not fetched. */
@@ -130,6 +136,8 @@ export interface EmailSearchArgs extends AccountArg {
   query: string
   folder?: string
   limit?: number
+  /** Field to search; defaults to all searchable headers plus body fallback. */
+  field?: 'all' | 'body' | 'subject' | 'from' | 'recipient'
 }
 
 export interface EmailSendArgs extends AccountArg {

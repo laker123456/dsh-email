@@ -526,26 +526,31 @@ export class EmailPool {
     return result
   }
 
-  async search(accountName: string | undefined, query: string, folder: string, limit: number): Promise<EmailSearchResult> {
+  async search(
+    accountName: string | undefined,
+    query: string,
+    folder: string,
+    limit: number,
+    field: 'all' | 'body' | 'subject' | 'from' | 'recipient' = 'all',
+  ): Promise<EmailSearchResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
     return this.withImap(name, folderName, async (client) => {
-      // No nested OR and no TEXT search: several servers (QQ among them)
-      // silently answer those with empty or match-everything results.
-      // subject/from/to/cc searches unioned client-side behave well everywhere.
-      const found = await Promise.all([
-        client.search({ subject: query }, { uid: true }),
-        client.search({ from: query }, { uid: true }),
-        client.search({ to: query }, { uid: true }),
-          client.search({ cc: query }, { uid: true }),
-      ])
+      // Keep individual SEARCH commands simple for broad server compatibility.
+      // Recipient searches union To/Cc; the combined mode unions every field.
+      const criteria = field === 'subject' ? [{ subject: query }]
+        : field === 'from' ? [{ from: query }]
+          : field === 'recipient' ? [{ to: query }, { cc: query }]
+            : field === 'body' ? [{ body: query }]
+              : [{ subject: query }, { from: query }, { to: query }, { cc: query }, { body: query }]
+      const found = await Promise.all(criteria.map(rule => client.search(rule, { uid: true })))
       const uids = [...new Set(found.flatMap(result => result === false ? [] : result))].sort((a, b) => a - b)
       uids.reverse()
-      if (uids.length === 0 && this.settings.bodySearchFallback) {
+      if (uids.length === 0 && this.settings.bodySearchFallback && (field === 'all' || field === 'body')) {
         // Server-side search found nothing: fall back to a client-side scan of
-        // the most recent messages (subject/from/body), capped for time.
-        const messages = await this.searchBodies(client, query, folderName, limit)
+        // the most recent messages, capped for time.
+        const messages = await this.searchBodies(client, query, folderName, limit, field)
         return { account: name, query, count: messages.length, folder: folderName, messages }
       }
       const messages = await this.fetchListed(client, uids.slice(0, limit))
@@ -554,7 +559,13 @@ export class EmailPool {
   }
 
   /** Client-side scan of the tail of the mailbox, newest first. */
-  private async searchBodies(client: ImapFlow, query: string, folder: string, limit: number): Promise<ListedMessage[]> {
+  private async searchBodies(
+    client: ImapFlow,
+    query: string,
+    folder: string,
+    limit: number,
+    field: 'all' | 'body',
+  ): Promise<ListedMessage[]> {
     const mailbox = client.mailbox
     const total = mailbox === false ? 0 : mailbox.exists
     if (total === 0) return []
@@ -567,26 +578,21 @@ export class EmailPool {
     for (const message of [...fetched].reverse()) {
       if (out.length >= limit) break
       const subject = message.envelope?.subject ?? ''
-      
-          const recipientSearchText = [message.envelope?.from, message.envelope?.to, message.envelope?.cc]
-          .map(flattenAddressText).join(' ')
-        
-          
-        
-          
+      const recipientSearchText = [message.envelope?.from, message.envelope?.to, message.envelope?.cc]
+        .map(flattenAddressText).join(' ')
       let body = ''
       if (message.source !== undefined) {
         try {
-            const parsed = await parseRawMessage(message.source, 4096)
-              body = parsed.text
-    
-  
-          } catch {
-            // 单封邮件解析失败不应中断整批回退扫描，继续用 subject/from/to/cc 匹配。
-          }
-        
+          const parsed = await parseRawMessage(message.source, 4096)
+          body = parsed.text
+        } catch {
+          // 单封邮件解析失败不应中断整批回退扫描。
+        }
       }
-      if (messageMatchesQuery(subject, recipientSearchText, body, query)) {
+      const matches = field === 'body'
+        ? body.toLowerCase().includes(query.toLowerCase())
+        : messageMatchesQuery(subject, recipientSearchText, body, query)
+      if (matches) {
         out.push(listedFrom(message, message.size, structureHasAttachment(message.bodyStructure)))
       }
     }
@@ -765,8 +771,9 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
-    this.invalidateMailbox(name, folderName)
+    await this.invalidateMailbox(name, folderName)
     this.invalidateFolderCache(name)
+    this.invalidateLabelCache()
   }
 
   /** Mark multiple messages as seen (\\Seen) in a single IMAP session.
@@ -798,8 +805,9 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
-    this.invalidateMailbox(name, folderName)
+    await this.invalidateMailbox(name, folderName)
     this.invalidateFolderCache(name)
+    this.invalidateLabelCache()
   }
 
   /** Toggle \\Seen flag on/off via a read-write connection. */
@@ -818,8 +826,9 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
-    this.invalidateMailbox(name, folderName)
+    await this.invalidateMailbox(name, folderName)
     this.invalidateFolderCache(name)
+    this.invalidateLabelCache()
   }
 
   /** Move a message to another folder (used for delete-to-trash). */
@@ -837,8 +846,9 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
-    this.invalidateMailbox(name, folderName)
+    await this.invalidateMailbox(name, folderName)
     this.invalidateFolderCache(name)
+    this.invalidateLabelCache()
   }
 
   /** Toggle \\Flagged (pinned/starred) via a read-write connection. */
@@ -857,8 +867,9 @@ export class EmailPool {
     } finally {
       try { await client.logout() } catch { /* ignore */ }
     }
-    this.invalidateMailbox(name, folderName)
+    await this.invalidateMailbox(name, folderName)
     this.invalidateFolderCache(name)
+    this.invalidateLabelCache()
   }
 
   /**
@@ -867,9 +878,17 @@ export class EmailPool {
    * separate read-write connection. Without this, Coremail/IMAP servers may
    * keep serving stale flags from the readOnly mailbox snapshot.
    */
-  invalidateMailbox(name: string, folder: string): void {
-    const entry = this.imaps.get(name)
-    if (entry && entry.selected === folder) entry.selected = null
+  async invalidateMailbox(name: string, folder: string): Promise<void> {
+    await this.enqueue(name, async () => {
+      const entry = this.imaps.get(name)
+      if (entry && entry.selected === folder) {
+        // A SELECTed read-only connection can keep returning its old FLAGS
+        // snapshot after another connection performs STORE. Reconnecting is
+        // deterministic across Coremail servers; merely calling mailboxOpen
+        // for the same folder can be optimized away by the client.
+        await this.evictImap(name)
+      }
+    })
   }
 
   async folders(accountName: string | undefined, subscribedOnly: boolean): Promise<EmailFoldersResult> {
@@ -895,8 +914,11 @@ export class EmailPool {
         folders.push({
           name: row.name ?? row.path,
           path: row.path,
+          delimiter: row.delimiter ?? '',
+          parentPath: row.parentPath ?? '',
           specialUse: row.specialUse ?? '',
           subscribed: row.subscribed !== false,
+          selectable: !row.flags?.has('\\Noselect'),
           total,
           unread,
         })

@@ -96,8 +96,18 @@ test('inbox page is served as no-store HTML', async () => {
   assert.ok(res.body().includes('id="markSeenProgress"'))
   assert.ok(res.body().includes("'Accept': 'application/x-ndjson'"))
   assert.ok(res.body().includes('function clearMessageDetail()'))
+  assert.ok(res.body().includes('doc._dshExternalLinksBound'))
+  assert.ok(res.body().includes("console.log('__WEBAN_OPEN_EXTERNAL__:' + externalUrl.href)"))
+  assert.ok(!res.body().includes("window.open(externalUrl.href"))
   assert.ok(res.body().includes('renderMessageHeader(preview, uid, effFolder)'))
   assert.ok(res.body().includes('id="bodyLoading"'))
+  assert.ok(res.body().includes('function imapFolderDepth(folder, byPath)'))
+  assert.ok(res.body().includes('id="mailboxAccount"'))
+  assert.ok(res.body().includes('id="searchType"'))
+  assert.ok(res.body().includes('border: 1px solid #b8b8b8'))
+  assert.ok(res.body().indexOf('id="searchInput"') < res.body().indexOf('id="mailboxAccount"'))
+  assert.ok(res.body().includes("f.selectable === false"))
+  assert.ok(!res.body().includes("/病毒|Virus|Infected/i.test(a.path)"))
   assert.ok(res.body().includes("state.view !== 'folder' && state.view !== 'unread'"))
   assert.ok(res.body().includes('if (!ok) state.offset = previousOffset'))
   assert.ok(res.body().includes(INBOX_ROUTE))
@@ -143,6 +153,28 @@ test('unknown inbox sub-path answers 404', async () => {
   const holder = installRoute(() => { throw new Error('no pool') })
   const res = await call(holder.routes[0], fakeReq(INBOX_ROUTE + '/api/nope'))
   assert.equal(res.statusCode, 404)
+})
+
+test('search forwards the selected field to the IMAP pool', async () => {
+  const calls = []
+  const holder = installRoute(() => ({
+    search: async (...args) => {
+      calls.push(args)
+      return { account: 'default', query: '周报', count: 0, folder: 'INBOX', messages: [] }
+    },
+  }))
+  const res = await call(holder.routes[0], fakeReq(INBOX_ROUTE + '/api/search?q=%E5%91%A8%E6%8A%A5&type=subject&folder=INBOX&limit=25'))
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(calls, [[undefined, '周报', 'INBOX', 25, 'subject']])
+})
+
+test('search rejects an unknown field', async () => {
+  let called = false
+  const holder = installRoute(() => ({ search: async () => { called = true } }))
+  const res = await call(holder.routes[0], fakeReq(INBOX_ROUTE + '/api/search?q=x&type=nope&folder=INBOX'))
+  assert.equal(res.statusCode, 400)
+  assert.equal(called, false)
+  assert.match(res.json().error.message, /搜索类型/)
 })
 
 test('unconfigured account maps to a 400 envelope with the actionable message', async () => {

@@ -313,10 +313,11 @@ export function apply(ctx: any, config: Config = {}): void {
 
   ctx.tools.register({
     name: 'email_search',
-    description: 'Search emails by a keyword matched against sender, recipient and subject (server-side IMAP SEARCH). Body search is not supported by every server and is not attempted; returns the same compact rows as email_list.'
+    description: 'Search emails by keyword in all supported fields or one selected field. Header searches use server-side IMAP SEARCH; body search falls back to a bounded recent-message scan when needed.'
 ,
     parameters: compileParameters({
       query: { type: 'string', required: true, description: 'Keyword to search for' },
+      field: { type: 'string', enum: ['all', 'body', 'subject', 'from', 'recipient'], description: 'Field to search, default all' },
       folder: { type: 'string', description: 'IMAP folder to search in; defaults to the account inboxFolder' },
       limit: { type: 'integer', description: 'How many matches to return, 1-100, default 10' },
       account: { type: 'string', description: ACCOUNT_HINT },
@@ -329,7 +330,8 @@ export function apply(ctx: any, config: Config = {}): void {
       const args = rawArgs as EmailSearchArgs
       if (typeof args.query !== 'string' || args.query.trim() === '') throw new Error('query 不能为空')
       const limit = clampInt(args.limit, 10, 1, MAX_LIMIT)
-      return await getPool().search(args.account, args.query.trim(), args.folder?.trim() || '', limit)
+      const field = args.field ?? 'all'
+      return await getPool().search(args.account, args.query.trim(), args.folder?.trim() || '', limit, field)
     },
   })
 

@@ -1102,8 +1102,14 @@ async function handleInbox(getPool: () => EmailPool, settingsScope: any, ctx: an
         return
       }
       const limit = clampInt(Number(url.searchParams.get('limit') ?? 50), 50, 1, 200)
+      const type = url.searchParams.get('type') ?? 'all'
+      const searchTypes = ['all', 'body', 'subject', 'from', 'recipient'] as const
+      if (!searchTypes.includes(type as typeof searchTypes[number])) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: '未知搜索类型：' + type } })
+        return
+      }
       const folderName = folder || pool.resolveName(account) && pool.account(pool.resolveName(account)).inboxFolder || 'INBOX'
-      const value = await pool.search(account, q, folderName, limit)
+      const value = await pool.search(account, q, folderName, limit, type as typeof searchTypes[number])
       responseJson(res, 200, { ok: true, value })
       return
     }
@@ -1245,13 +1251,32 @@ button, select, input { font: inherit; }
 }
 .logo-title { font-size: 20px; font-weight: bold; color: #e0a37a; display: flex; align-items: center; gap: 6px; }
 .logo-title .logo-sub { font-size: 10px; color: #e0a37a; font-weight: normal; line-height: 1.1; }
-.search-bar { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 100%; max-width: 360px; }
-.search-bar input {
-  width: 100%; height: 32px; background: #fff; border: 1px solid transparent;
-  border-radius: 16px; padding: 0 16px 0 36px; font-size: 13px; outline: none; color: #333;
+.search-bar {
+  width: 100%; height: 30px; display: flex; align-items: center; box-sizing: border-box;
+  background: #fff; border: 1px solid #b8b8b8; border-radius: 2px; overflow: hidden;
+  margin-bottom: 8px; transition: border-color .15s ease, box-shadow .15s ease;
 }
-.search-bar input:focus { background: #fff; border-color: #d97a4e; }
-.search-bar i { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: #8a97a8; }
+.search-bar:hover { border-color: #8f8f8f; }
+.search-bar:focus-within { border-color: #7f8b99; box-shadow: 0 0 0 1px rgba(127,139,153,.08); }
+.search-bar input {
+  min-width: 0; flex: 1; height: 28px; background: #fff; border: none;
+  padding: 0 4px 0 7px; font-size: 12px; outline: none; color: #333;
+}
+.search-bar > i { margin-left: 9px; color: #8a97a8; font-size: 13px; flex-shrink: 0; }
+.search-type-picker {
+  position: relative; width: 30px; height: 22px; flex: 0 0 30px;
+  border-left: 1px solid #e1e1e1; background: #fff;
+}
+.search-type-picker select {
+  position: absolute; inset: 0; width: 100%; height: 100%; padding: 0;
+  border: none; background: transparent; color: transparent; font-size: 0;
+  appearance: none; -webkit-appearance: none; outline: none; cursor: pointer; z-index: 2;
+}
+.search-type-picker select option { color: #333; font-size: 12px; }
+.search-type-picker > i {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: #666; font-size: 11px; pointer-events: none; z-index: 1;
+}
 .user-area { display: flex; align-items: center; gap: 12px; font-size: 12px; color: #555; }
 
 /* 主体 */
@@ -1281,6 +1306,12 @@ button, select, input { font: inherit; }
 .btn-compose:hover { filter: brightness(1.05); }
 .menu-group { margin-bottom: 8px; }
 .menu-title { font-size: 11px; color: #8a97a8; padding: 4px 12px; }
+.mailbox-account {
+  display: flex; align-items: center; gap: 7px; min-width: 0; padding: 3px 10px 8px;
+  color: #333; font-size: 12px; font-weight: 600;
+}
+.mailbox-account i { color: #d97a4e; flex-shrink: 0; }
+.mailbox-account span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-item {
   display: flex; align-items: center; justify-content: space-between;
   padding: 5px 12px; border-radius: 6px; color: #333; cursor: pointer;
@@ -1288,6 +1319,13 @@ button, select, input { font: inherit; }
 }
 .menu-item:hover { background: #fbf1de; }
 .menu-item.active { background: #fdf5e2; color: #e0a37a; font-weight: 600; }
+.menu-item.folder-item { padding-left: calc(12px + var(--folder-depth, 0) * 16px); }
+.menu-item.folder-parent { cursor: default; color: #667085; }
+.menu-item.folder-parent:hover { background: none; }
+.menu-item.folder-item[data-depth]:not([data-depth="0"]) .menu-item-left::before {
+  content: ''; width: 6px; height: 6px; margin-left: -3px; border-left: 1px solid #c9bda8;
+  border-bottom: 1px solid #c9bda8; flex-shrink: 0; transform: translateY(-2px);
+}
 .menu-item-left { display: flex; align-items: center; gap: 10px; overflow: hidden; }
 .menu-item-left i { width: 16px; text-align: center; color: #666; flex-shrink: 0; }
 .menu-item.active .menu-item-left i { color: #e0a37a; }
@@ -1333,25 +1371,25 @@ button, select, input { font: inherit; }
 .list-toolbar button:disabled { cursor: default; opacity: .65; }
 #markSeenProgress {
   position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
-  background: rgba(20, 28, 40, .18); backdrop-filter: blur(1px); z-index: 200;
+  background: rgba(239, 225, 200, .38); backdrop-filter: blur(1px); z-index: 200;
 }
 #markSeenProgress .progress-card {
-  width: 180px; padding: 24px 20px 20px; border: 1px solid #e1e6ed; border-radius: 14px;
-  background: #fff; box-shadow: 0 12px 36px rgba(20, 28, 40, .2); text-align: center;
+  width: 156px; padding: 18px 16px 16px; border: 1px solid #dec89f; border-radius: 12px;
+  background: #fdf5e2; box-shadow: 0 10px 28px rgba(115, 72, 38, .18); text-align: center;
 }
-#markSeenProgress .progress-ring { position: relative; width: 96px; height: 96px; margin: 0 auto 14px; }
-#markSeenProgress svg { width: 96px; height: 96px; transform: rotate(-90deg); }
-#markSeenProgress circle { fill: none; stroke-width: 8; }
-#markSeenProgress .progress-track { stroke: #edf0f5; }
+#markSeenProgress .progress-ring { position: relative; width: 80px; height: 80px; margin: 0 auto 10px; }
+#markSeenProgress svg { width: 80px; height: 80px; transform: rotate(-90deg); }
+#markSeenProgress circle { fill: none; stroke-width: 7; }
+#markSeenProgress .progress-track { stroke: #f3e3cd; }
 #markSeenProgress .progress-value {
-  stroke: #3b7bff; stroke-linecap: round; stroke-dasharray: 251.33; stroke-dashoffset: 251.33;
+  stroke: #d97a4e; stroke-linecap: round; stroke-dasharray: 251.33; stroke-dashoffset: 251.33;
   transition: stroke-dashoffset .2s ease;
 }
 #markSeenProgress .progress-count {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  color: #27364a; font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums;
+  color: #8a4b2e; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums;
 }
-#markSeenProgress .progress-label { color: #4a5566; font-size: 13px; }
+#markSeenProgress .progress-label { color: #8a4b2e; font-size: 12px; }
 #messages { list-style: none; margin: 0; padding: 0; overflow: auto; flex: 1; }
 #messages li { padding: 10px 14px; border-bottom: 1px solid #dec89f; cursor: pointer; }
 #messages li:hover { background: #f3e3cd; }
@@ -1524,6 +1562,7 @@ dialog#labelModal {
 #composeModal .btn-c.primary { background: #3b7bff; color: #fff; border-color: #3b7bff; }
 #composeModal .btn-c.primary:hover { background: #2a69ea; }
 #composeModal .topbar-right { display: flex; gap: 14px; align-items: center; color: #666; font-size: 12px; }
+#composeModal .topbar-right strong { color: #333; font-weight: 500; }
 #composeModal .topbar-right span { cursor: pointer; }
 #composeModal .form-row {
   display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0;
@@ -1633,12 +1672,6 @@ dialog#labelModal {
 #composeModal .editor-content:empty::before {
   content: attr(data-placeholder); color: #b0b6bf; pointer-events: none;
 }
-#composeModal .compose-footer {
-  display: flex; align-items: center; gap: 12px; margin-top: 10px; color: #666; font-size: 12px;
-}
-#composeModal .compose-footer .from-info { color: #666; }
-#composeModal .compose-footer .from-info strong { color: #333; }
-#composeModal .compose-footer .footer-actions { margin-left: auto; display: flex; gap: 8px; }
 #composeModal #composeMsg { color: #cf222e; font-size: 12px; min-height: 14px; margin-top: 6px; }
 #imgToolbar {
   position: absolute; display: none; z-index: 9999;
@@ -1732,10 +1765,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       <i class="fa-solid fa-pen-to-square"></i> 写信
     </button>
   </div>
-  <div class="search-bar">
-    <i class="fa-solid fa-magnifying-glass"></i>
-    <input id="searchInput" type="text" placeholder="搜索邮件主题/发件人/收件人/正文" autocomplete="off">
-  </div>
   <div class="user-area">
     <button id="aiAssistantBtn" type="button" title="AI 助理" style="border:none;background:none;cursor:pointer;padding:0;display:flex;align-items:center;gap:6px;font-size:13px;color:#333;display:none">
       <img src="${INBOX_ROUTE}/api/asset/emailAI.png" alt="AI助理" style="width:24px;height:24px;border-radius:50%">
@@ -1775,8 +1804,22 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 
 <div class="main-container" id="mainView">
   <div class="sidebar">
+    <div class="search-bar">
+      <i class="fa-solid fa-magnifying-glass"></i>
+      <input id="searchInput" type="text" placeholder="搜索全部字段" autocomplete="off">
+      <span class="search-type-picker" title="选择搜索类型">
+        <select id="searchType" aria-label="搜索类型">
+          <option value="all">全部</option>
+          <option value="body">正文</option>
+          <option value="subject">主题</option>
+          <option value="from">发件人</option>
+          <option value="recipient">收件人</option>
+        </select>
+        <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+      </span>
+    </div>
     <div class="menu-group">
-      <div class="menu-title">文件夹</div>
+      <div class="mailbox-account" title="当前邮箱"><i class="fa-regular fa-envelope"></i><span id="mailboxAccount">邮箱</span></div>
       <nav id="folders"></nav>
     </div>
     <div class="menu-group" id="labelsGroup">
@@ -1893,7 +1936,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         <button type="button" class="btn-c" id="composeCancel">取消</button>
       </div>
       <div class="topbar-right">
-        <span class="placeholder-tip">自动从原邮件带入抄送人</span>
+        <span>发件人：<strong id="composeFrom">加载中…</strong></span>
       </div>
     </div>
     <div class="compose-body">
@@ -2051,13 +2094,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         </div>
         <div id="composeEditor" class="editor-content" contenteditable="true" data-placeholder="在这里撰写正文…"></div>
       </div>
-      <div class="compose-footer">
-        <div class="from-info">发件人：<strong id="composeFrom">加载中…</strong></div>
-        <div class="footer-actions">
-          <button type="button" class="btn-c primary" id="composeSend2"><i class="fa-solid fa-paper-plane"></i> 发送</button>
-          <button type="button" class="btn-c" id="composeCancel2">取消</button>
-        </div>
-      </div>
       <div id="composeMsg"></div>
     </div>
   </form>
@@ -2067,7 +2103,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 (function () {
   'use strict';
   var BASE = '${INBOX_ROUTE}';
-  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [], zoom: 1, markSeenBusy: false, listVersion: 0, loadingMore: false };
+  var state = { account: '', folder: '', view: 'folder', labelId: '', unreadOnly: false, offset: 0, limit: 20, uid: null, imagesAllowed: true, openToken: 0, forwardToken: 0, labels: [], zoom: 1, markSeenBusy: false, listVersion: 0, loadingMore: false, seenOverrides: {} };
   var currentMsg = null;
   var LABEL_COLORS = ['#e0a37a', '#cf222e', '#1a7f37', '#9333ea', '#d97706', '#0891b2', '#db2777', '#4b5563'];
 
@@ -2091,6 +2127,22 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (n > 1048576) return (n / 1048576).toFixed(1) + ' MB';
     if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
     return n + ' B';
+  }
+  function seenOverrideKey(folder, uid) {
+    return (state.account || 'default') + '|' + String(folder || '') + '|' + String(uid);
+  }
+  function setSeenOverride(folder, uid, seen) {
+    state.seenOverrides[seenOverrideKey(folder, uid)] = Boolean(seen);
+  }
+  function clearSeenOverride(folder, uid) {
+    delete state.seenOverrides[seenOverrideKey(folder, uid)];
+  }
+  function effectiveSeen(message, folder) {
+    var key = seenOverrideKey(folder, message.uid);
+    if (!Object.prototype.hasOwnProperty.call(state.seenOverrides, key)) return Boolean(message.seen);
+    var expected = state.seenOverrides[key];
+    if (Boolean(message.seen) === expected) delete state.seenOverrides[key];
+    return expected;
   }
   function fmtDate(iso, local) {
     if (local) return local;
@@ -2152,6 +2204,17 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (FOLDER_LABELS[key]) return FOLDER_LABELS[key];
     if (key.toUpperCase() === 'INBOX') return '收件箱';
     return f.name || f.path;
+  }
+  function imapFolderDepth(folder, byPath) {
+    var depth = 0;
+    var parentPath = folder.parentPath || '';
+    var visited = {};
+    while (parentPath && byPath[parentPath] && !visited[parentPath] && depth < 8) {
+      visited[parentPath] = true;
+      depth += 1;
+      parentPath = byPath[parentPath].parentPath || '';
+    }
+    return depth;
   }
   function qs(params) {
     var u = new URLSearchParams();
@@ -2230,21 +2293,34 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     });
   }
 
+  function loadMailboxIdentity() {
+    return fetch(BASE + '/api/me' + qs({ account: state.account })).then(function (res) {
+      return res.json().catch(function () { return null; });
+    }).then(function (data) {
+      var label = document.getElementById('mailboxAccount');
+      if (!label || !data || !data.ok || !data.value) return;
+      label.textContent = data.value.user || data.value.account || '邮箱';
+      label.parentElement.title = label.textContent;
+    }).catch(function () { /* folder loading reports configuration errors */ });
+  }
+
   function renderFolders(value) {
       var accounts = value.accounts || [];
       if (!state.account && accounts.length > 0) state.account = accounts[0];
+      var accountLabel = document.getElementById('mailboxAccount');
+      if (accountLabel && accountLabel.textContent === '邮箱') accountLabel.textContent = state.account || '邮箱';
+      // Preserve ImapFlow's IMAP-derived order. IMAP itself has no portable
+      // per-user display-order attribute, so the browser must not invent one.
       var folders = (value.folders || []).slice();
-      folders.sort(function (a, b) {
-        var av = /病毒|Virus|Infected/i.test(a.path) ? 1 : 0;
-        var bv = /病毒|Virus|Infected/i.test(b.path) ? 1 : 0;
-        return av - bv;
-      });
-      var known = folders.some(function (f) { return f.path === state.folder; });
+      var foldersByPath = {};
+      folders.forEach(function (f) { foldersByPath[f.path] = f; });
+      var known = folders.some(function (f) { return f.path === state.folder && f.selectable !== false; });
       if (!known) {
         var inbox = folders.filter(function (f) {
-          return f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX';
+          return f.selectable !== false && (f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX');
         })[0];
-        state.folder = (inbox || folders[0] || { path: '' }).path;
+        var firstSelectable = folders.filter(function (f) { return f.selectable !== false; })[0];
+        state.folder = (inbox || firstSelectable || { path: '' }).path;
       }
       var nav = document.getElementById('folders');
       nav.innerHTML = '';
@@ -2272,7 +2348,6 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         empty.appendChild(eBtn);
         nav.appendChild(empty);
       }
-      var trashIdx = -1;
       var unreadBtn = document.createElement('button');
       unreadBtn.type = 'button';
       unreadBtn.id = 'unreadBtn';
@@ -2303,11 +2378,14 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       };
       var unreadTotal = 0;
       var unreadInserted = false;
-      folders.forEach(function (f, i) {
+      folders.forEach(function (f) {
         var btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'menu-item';
+        btn.className = 'menu-item folder-item';
         btn.dataset.path = f.path;
+        var depth = imapFolderDepth(f, foldersByPath);
+        btn.dataset.depth = String(depth);
+        btn.style.setProperty('--folder-depth', String(depth));
         btn.title = f.path + (f.specialUse ? ' [' + f.specialUse + ']' : '') + (f.subscribed ? '' : '（未订阅）');
         if (f.path === state.folder) btn.classList.add('active');
         var left = document.createElement('div');
@@ -2327,23 +2405,27 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
           c.title = '未读 ' + unread;
           btn.appendChild(c);
         }
-        btn.onclick = function () {
-          if (state.view === 'folder' && state.folder === f.path) return;
-          state.view = 'folder';
-          state.folder = f.path;
-          state.offset = 0;
-          clearMessageDetail();
-          markActiveFolder();
-          markActiveLabel();
-          loadList();
-        };
+        if (f.selectable === false) {
+          btn.classList.add('folder-parent');
+          btn.setAttribute('aria-disabled', 'true');
+        } else {
+          btn.onclick = function () {
+            if (state.view === 'folder' && state.folder === f.path) return;
+            state.view = 'folder';
+            state.folder = f.path;
+            state.offset = 0;
+            clearMessageDetail();
+            markActiveFolder();
+            markActiveLabel();
+            loadList();
+          };
+        }
         nav.appendChild(btn);
         if (f.unread > 0) unreadTotal += f.unread;
         if (f.specialUse === '\\\\Inbox' || String(f.path).toUpperCase() === 'INBOX') {
           nav.appendChild(unreadBtn);
           unreadInserted = true;
         }
-        if (trashIdx < 0 && (f.specialUse === '\\\\Trash' || /已删除|Trash|Deleted/i.test(f.path))) trashIdx = i;
       });
       if (!unreadInserted) nav.insertBefore(unreadBtn, nav.firstChild);
       setUnreadBadge(unreadTotal);
@@ -2370,18 +2452,15 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       todoBtn.onclick = function () {
         if (state.view === 'todo') return;
         state.view = 'todo';
+        state.offset = 0;
+        clearMessageDetail();
         markActiveFolder();
         markActiveLabel();
         openTodoView();
       };
-      var inserted = false;
-      if (trashIdx >= 0) {
-        var after = nav.children[trashIdx + 1];
-        if (after) nav.insertBefore(todoBtn, after);
-        else nav.appendChild(todoBtn);
-        inserted = true;
-      }
-      if (!inserted) nav.appendChild(todoBtn);
+      // These are local virtual views; keep them beside INBOX without changing
+      // the relative order of any real mailbox returned by IMAP.
+      nav.insertBefore(todoBtn, unreadBtn.nextSibling);
   }
   function markActiveFolder() {
     var btns = document.querySelectorAll('#folders .menu-item');
@@ -2593,12 +2672,14 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     return api('/api/messages-unread', { account: state.account, limit: state.limit, offset: state.offset }).then(function (value) {
       if (requestVersion !== state.listVersion || state.view !== 'unread') return false;
       var had = listEl.querySelectorAll('li[data-uid]').length;
-      var msgs = value.messages || [];
+      var rawMsgs = value.messages || [];
+      var msgs = rawMsgs.filter(function (m) { return !effectiveSeen(m, m.folder || state.folder); });
+      var effectiveCount = Math.max(0, value.count - (rawMsgs.length - msgs.length));
       msgs.forEach(function (m) { listEl.appendChild(unreadRowEl(m)); });
       sortMessageRowsByDate(listEl);
-      if (typeof value.count === 'number' && value.count > 0) setUnreadBadge(value.count);
+      if (typeof value.count === 'number') setUnreadBadge(effectiveCount);
       var shown = listEl.querySelectorAll('li[data-uid]').length;
-      state.hasMore = shown < value.count;
+      state.hasMore = shown < effectiveCount;
       if (had === 0 && msgs.length === 0) {
         var hint = document.createElement('li');
         hint.className = 'hint';
@@ -2817,8 +2898,9 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     var li = document.createElement('li');
     li.dataset.uid = String(m.uid);
     var effFolder = m.folder || state.folder;
+    var seen = effectiveSeen(m, effFolder);
     li.dataset.folder = effFolder;
-    li.dataset.seen = m.seen ? '1' : '0';
+    li.dataset.seen = seen ? '1' : '0';
     li.dataset.flagged = m.flagged ? '1' : '0';
     li.dataset.subject = m.subject || '(无主题)';
     li.dataset.from = (m.from || []).map(function (a) {
@@ -2830,7 +2912,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       return p.address || p.name;
     }).filter(Boolean).join(',');
     li.dataset.date = m.date || '';
-    if (!m.seen) li.classList.add('unread');
+    if (!seen) li.classList.add('unread');
     if (m.uid === state.uid) li.classList.add('active');
     var subject = document.createElement('span');
     subject.className = 'subject';
@@ -2976,6 +3058,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         body: JSON.stringify({ account: state.account, folder: folder, uid: uid, on: !seen }),
       }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
         if (d && d.ok) {
+          setSeenOverride(folder, uid, !seen);
           var li = document.querySelector('#messages li[data-uid="' + uid + '"]');
           if (li) {
             li.classList.toggle('unread', seen);
@@ -3066,10 +3149,12 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var prependBucket = [];
       fresh.forEach(function (m) {
         var key = String(m.uid);
+        var freshSeen = effectiveSeen(m, m.folder || state.folder);
         seen[key] = true;
         var old = existing[key];
         if (old) {
-          old.classList.toggle('unread', !m.seen);
+          old.classList.toggle('unread', !freshSeen);
+          old.dataset.seen = freshSeen ? '1' : '0';
           old.classList.toggle('active', m.uid === state.uid);
           existing[key] = null;
         } else {
@@ -3122,6 +3207,23 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         if (!doc || !doc.body || href.indexOf('/api/message.html') < 0) {
           if (attempts < 120) pollTimer = setTimeout(syncFrame, 100);
           return;
+        }
+        if (!doc._dshExternalLinksBound) {
+          doc._dshExternalLinksBound = true;
+          doc.addEventListener('click', function (e) {
+            if (e.defaultPrevented || (typeof e.button === 'number' && e.button !== 0)) return;
+            var target = e.target;
+            var link = target && target.closest ? target.closest('a[href]') : null;
+            if (!link) return;
+            var rawHref = (link.getAttribute('href') || '').trim();
+            if (!rawHref || rawHref.charAt(0) === '#') return;
+            var externalUrl;
+            try { externalUrl = new URL(link.href, doc.location.href); } catch (err) { return; }
+            if (externalUrl.protocol !== 'http:' && externalUrl.protocol !== 'https:') return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            console.log('__WEBAN_OPEN_EXTERNAL__:' + externalUrl.href);
+          }, true);
         }
         var loading = document.getElementById('readerLoading');
         if (loading) loading.style.display = 'none';
@@ -3250,6 +3352,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
       if (d && d.ok) {
         currentMsg.seen = targetSeen;
+        setSeenOverride(currentMsg.folder, currentMsg.uid, targetSeen);
         updateDetailSeenLabel();
         var li = document.querySelector('#messages li[data-uid="' + currentMsg.uid + '"]');
         if (li) {
@@ -3315,15 +3418,26 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       li.classList.toggle('active', match);
       if (match && li.classList.contains('unread')) {
         li.classList.remove('unread');
+        li.dataset.seen = '1';
         flipped = true;
       }
     }
     if (flipped) {
+      setSeenOverride(effFolder, uid, true);
       fetch(BASE + '/api/mark-seen', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ account: state.account, folder: effFolder, uid: uid }),
-      }).catch(function () { /* best-effort; UI already updated */ });
+      }).then(function (res) { return res.json().catch(function () { return null; }); }).then(function (d) {
+        if (!d || !d.ok) throw new Error((d && d.error && d.error.message) || '标记已读失败');
+      }).catch(function (err) {
+        clearSeenOverride(effFolder, uid);
+        var current = document.querySelector('#messages li[data-uid="' + uid + '"][data-folder="' + CSS.escape(effFolder) + '"]');
+        if (current) { current.classList.add('unread'); current.dataset.seen = '0'; }
+        bumpUnreadBadge(1);
+        bumpFolderBadge(effFolder, 1);
+        showBanner(err && err.message ? err.message : '标记已读失败');
+      });
       bumpUnreadBadge(-1);
       bumpFolderBadge(effFolder, -1);
     }
@@ -3468,6 +3582,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       var key = JSON.stringify([folder, event.uid]);
       if (!completedKeys[key]) {
         completedKeys[key] = true;
+        setSeenOverride(folder, event.uid, true);
         for (var i = 0; i < targets.length; i++) {
           var li = targets[i];
           if (String(li.dataset.uid) === String(event.uid) && (li.dataset.folder || state.folder) === folder) {
@@ -3565,7 +3680,15 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     };
   }
   var searchInput = document.getElementById('searchInput');
+  var searchType = document.getElementById('searchType');
+  var searchTypeLabels = { all: '全部字段', body: '正文', subject: '主题', from: '发件人', recipient: '收件人' };
   var searchTimer = null;
+  if (searchType && searchInput) {
+    searchType.onchange = function () {
+      searchInput.placeholder = '搜索' + (searchTypeLabels[this.value] || '邮件');
+      searchInput.focus();
+    };
+  }
   if (searchInput) {
     searchInput.oninput = function () {
       if (this.value.trim() !== '') return;
@@ -3591,8 +3714,11 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
         return;
       }
       if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }
+      var type = searchType ? searchType.value : 'all';
+      var typeLabel = searchTypeLabels[type] || '邮件';
       state.view = 'search';
       state.searchQ = q;
+      state.searchType = type;
       state.offset = 0;
       clearMessageDetail();
       markActiveFolder();
@@ -3601,17 +3727,17 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       listEl.innerHTML = '';
       var loading = document.createElement('li');
       loading.className = 'hint';
-      loading.textContent = '搜索 "' + q + '" 中…';
+      loading.textContent = '在' + typeLabel + '中搜索 "' + q + '"…';
       listEl.appendChild(loading);
       var more = document.getElementById('more');
       if (more) more.style.display = 'none';
-      api('/api/search', { account: state.account, folder: state.folder, q: q, limit: 50 }).then(function (value) {
+      api('/api/search', { account: state.account, folder: state.folder, q: q, type: type, limit: 50 }).then(function (value) {
         listEl.innerHTML = '';
         var msgs = value.messages || [];
         if (msgs.length === 0) {
           var hint = document.createElement('li');
           hint.className = 'hint';
-          hint.textContent = '没有匹配 "' + q + '" 的邮件';
+          hint.textContent = typeLabel + '中没有匹配 "' + q + '" 的邮件';
           listEl.appendChild(hint);
           return;
         }
@@ -3756,10 +3882,13 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
       if (range.collapsed) {
         var span = document.createElement('span');
         span.style.fontSize = px;
-        span.appendChild(document.createTextNode(''));
+        // A truly empty text node has length 0, so placing the caret at
+        // offset 1 throws and leaves subsequent typing outside the span.
+        // Select an invisible marker instead; the next typed character
+        // replaces it and inherits the requested font size.
+        span.appendChild(document.createTextNode('\u200b'));
         range.insertNode(span);
-        range.setStart(span.firstChild, 1);
-        range.setEnd(span.firstChild, 1);
+        range.selectNodeContents(span);
         selObj.removeAllRanges(); selObj.addRange(range);
       } else {
         document.execCommand('styleWithCSS', false, true);
@@ -4238,7 +4367,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     if (!to) { msg.textContent = '请填写收件人'; return; }
     if (!subject && !text) { msg.textContent = '主题和正文不能同时为空'; return; }
     msg.textContent = '';
-    var btns = [document.getElementById('composeSend'), document.getElementById('composeSend2')];
+    var btns = [document.getElementById('composeSend')];
     btns.forEach(function (b) { b.disabled = true; b.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> 发送中…'; });
     fetch(BASE + '/api/send', {
       method: 'POST',
@@ -4414,9 +4543,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     setActiveEditor(composeEditor);
   }
   document.getElementById('composeCancel').onclick = function () { document.getElementById('composeModal').setAttribute('hidden', ''); resetCompose(); };
-  document.getElementById('composeCancel2').onclick = function () { document.getElementById('composeModal').setAttribute('hidden', ''); resetCompose(); };
   document.getElementById('composeSend').onclick = doSend;
-  document.getElementById('composeSend2').onclick = doSend;
   document.getElementById('composeForm').onsubmit = function (e) { e.preventDefault(); doSend(); };
   document.getElementById('labelCancel').onclick = function () {
     document.getElementById('labelModal').close();
@@ -4494,6 +4621,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
     }).then(function () {
       btn.textContent = '已保存，加载中…';
       showMain();
+      loadMailboxIdentity();
       loadFolders().then(loadList).catch(function (err) {
         showBanner(err.message);
       });
@@ -4508,6 +4636,7 @@ dialog#confirmModal .btn-danger:hover { background: #b01b26; }
 
   loadLabels();
   loadTodoCount();
+  loadMailboxIdentity();
   loadFolders().then(function () {
     showMain();
     loadList();
